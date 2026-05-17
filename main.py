@@ -17,18 +17,21 @@
 import asyncio
 import logging
 import os
+import secrets
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, Optional
 
+from cachetools import TTLCache
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.security import APIKeyHeader
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
-from pydantic import BaseModel, Field, validator
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+from pydantic import BaseModel, Field, field_validator
 
 from utils import PageLogger, extract_all_sezioni, login, logout, run_visura, run_visura_immobile
 
@@ -74,6 +77,12 @@ class BrowserError(VisuraError):
     pass
 
 
+class QueueFullError(VisuraError):
+    """Raised when the request queue is at MAX_QUEUE_SIZE capacity."""
+
+    pass
+
+
 class ValidationError(VisuraError):
     """Raised when input validation fails"""
 
@@ -90,6 +99,10 @@ class VisuraRequest:
     particella: str
     sezione: Optional[str] = None
     subalterno: Optional[str] = None  # Opzionale: restringe la ricerca per fabbricati
+    codice_belfiore: Optional[str] = None  # Opzionale: se valorizzato bypassa il match-by-name del comune
+    fallback_other_catasto: bool = (
+        False  # Se True e il primo tentativo NON trova nulla, riprova sull'altro catasto (T<->F)
+    )
     timestamp: datetime = None
 
     def __post_init__(self):
@@ -109,6 +122,7 @@ class VisuraIntestatiRequest:
     particella: str
     subalterno: Optional[str] = None
     sezione: Optional[str] = None
+    codice_belfiore: Optional[str] = None
     timestamp: datetime = None
 
     def __post_init__(self):
@@ -139,6 +153,64 @@ class BrowserManager:
         self.authenticated = False
         self.keep_alive_running = False
         self.last_login_time = None
+        # Stats per resource blocking (popolato in initialize → context.route)
+        self.blocked_resources_count: int = 0
+        self.blocked_resources_samples: list = []  # primi N URL bloccati per diagnostica
+
+    async def _install_resource_blocking(self) -> None:
+        """Installa un route handler a livello context che blocca asset inutili.
+
+        Motivazione perf: SISTER carica 30-80 asset per pagina (logos, font,
+        icone, fogli stile esterni, talvolta tracker). La maggior parte non
+        serve all'API perché interagiamo via DOM/selettori, non visual rendering.
+        Bloccare ``image``/``font``/``media`` riduce la latenza di rete percepita
+        senza impattare ``page.evaluate`` / `get_by_role` / locator-based logic.
+
+        Diagnostica:
+          - ``RESOURCE_BLOCK=0`` disabilita il blocco (utile per debugging live
+            quando si sospetta che il blocking causi failure).
+          - ``RESOURCE_BLOCK_TYPES`` override CSV dei tipi bloccati
+            (default: ``image,font,media``). Per essere conservativi ``stylesheet``
+            NON e' bloccato di default — alcuni check di visibility Playwright
+            possono dipendere da CSS computed.
+          - Counter cumulativo (``blocked_resources_count``) + sample dei primi
+            10 URL (``blocked_resources_samples``) esposti su ``BrowserManager``
+            per ispezione via debug endpoint o log.
+          - Log per evento: ``[BLOCK] type=X url=Y`` (solo i primi 10) e
+            riepilogo periodico ``[BLOCK] cumulative=N``.
+        """
+        if os.getenv("RESOURCE_BLOCK", "1") != "1":
+            logger.info("[BLOCK] resource blocking disabilitato (RESOURCE_BLOCK=0)")
+            return
+
+        types_env = os.getenv("RESOURCE_BLOCK_TYPES", "image,font,media")
+        blocked_types = {t.strip().lower() for t in types_env.split(",") if t.strip()}
+        logger.info(f"[BLOCK] resource blocking attivo types={sorted(blocked_types)}")
+
+        async def _route_handler(route):
+            try:
+                rtype = route.request.resource_type
+                if rtype in blocked_types:
+                    self.blocked_resources_count += 1
+                    if len(self.blocked_resources_samples) < 10:
+                        sample = f"{rtype}:{route.request.url[:120]}"
+                        self.blocked_resources_samples.append(sample)
+                        logger.info(f"[BLOCK] type={rtype} url={route.request.url[:120]}")
+                    # Log periodico cumulativo ogni 200 blocchi
+                    if self.blocked_resources_count % 200 == 0:
+                        logger.info(f"[BLOCK] cumulative={self.blocked_resources_count}")
+                    await route.abort()
+                    return
+                await route.continue_()
+            except Exception as e:
+                # Non far mai rompere la richiesta a causa del blocking
+                logger.warning(f"[BLOCK] route handler error (continuing request): {e}")
+                try:
+                    await route.continue_()
+                except Exception:
+                    pass
+
+        await self.context.route("**/*", _route_handler)
 
     async def initialize(self):
         """Inizializza il browser e il contexto"""
@@ -171,32 +243,86 @@ class BrowserManager:
             )
 
             self.context = await self.browser.new_context()
+            # Reset counter + samples ad ogni init (anche su recovery)
+            self.blocked_resources_count = 0
+            self.blocked_resources_samples = []
+            await self._install_resource_blocking()
+            # Invalidate dropdown cache: nuovo context = nuove pagine SISTER fresh,
+            # le option list saranno ri-popolate alla prima richiesta.
+            try:
+                from utils import invalidate_dropdown_cache
+
+                invalidate_dropdown_cache(reason="browser_initialize")
+            except Exception as e:
+                logger.warning(f"invalidate_dropdown_cache failed at init: {e}")
             logger.info("Browser inizializzato")
         except Exception as e:
             logger.error(f"Failed to initialize browser: {e}")
             raise BrowserError(f"Browser initialization failed: {e}") from e
 
     async def login(self):
-        """Esegue il login nella prima tab"""
-        try:
-            # Chiudi la vecchia pagina prima di crearne una nuova
-            if self.auth_page and not self.auth_page.is_closed():
-                try:
-                    await self.auth_page.close()
-                    logger.info("Vecchia pagina di autenticazione chiusa")
-                except Exception as e:
-                    logger.warning(f"Errore chiudendo vecchia pagina: {e}")
+        """Esegue il login nella prima tab con retry per push SPID non approvata.
 
-            page = await self.context.new_page()
-            await login(page)
-            self.auth_page = page
-            self.authenticated = True
-            self.last_login_time = datetime.now()
-            logger.info("Login completato con successo")
-        except Exception as e:
-            logger.error(f"Errore durante il login: {e}")
-            self.authenticated = False
-            raise AuthenticationError(f"Login failed: {e}") from e
+        Distingue due classi di errore:
+
+        * ``PlaywrightTimeoutError`` — tipicamente la push SPID non e' stata
+          approvata in tempo dall'utente (timeout 120s sul click 'Autorizza'
+          per Sielte o sul redirect post-push per Poste). Ritentiamo fino a
+          ``LOGIN_MAX_ATTEMPTS`` (default 3) volte, con un breve sleep tra
+          tentativi per evitare push back-to-back.
+        * Altri errori (``RuntimeError`` fail-fast su credenziali sbagliate,
+          ``BrowserError``, ecc.) — falliscono al primo colpo perche'
+          ritentare e' inutile (le credenziali errate restano errate).
+        """
+        max_attempts = max(1, int(os.getenv("LOGIN_MAX_ATTEMPTS", "3")))
+        retry_delay_s = max(0, int(os.getenv("LOGIN_RETRY_DELAY_S", "5")))
+        last_exc: Optional[Exception] = None
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                # Chiudi la vecchia pagina prima di crearne una nuova
+                if self.auth_page and not self.auth_page.is_closed():
+                    try:
+                        await self.auth_page.close()
+                        logger.info("Vecchia pagina di autenticazione chiusa")
+                    except Exception as e:
+                        logger.warning(f"Errore chiudendo vecchia pagina: {e}")
+
+                page = await self.context.new_page()
+                logger.info(f"Tentativo login {attempt}/{max_attempts}")
+                await login(page)
+                self.auth_page = page
+                self.authenticated = True
+                self.last_login_time = datetime.now()
+                logger.info(f"Login completato con successo al tentativo {attempt}")
+                return
+            except PlaywrightTimeoutError as e:
+                # Push SPID non approvata in tempo — utente probabilmente
+                # distratto o push arrivata in ritardo. Ritentiamo.
+                last_exc = e
+                logger.warning(
+                    f"Tentativo login {attempt}/{max_attempts} fallito per timeout "
+                    f"(probabile push SPID non approvata): {e}"
+                )
+                self.authenticated = False
+                if attempt < max_attempts:
+                    logger.info(
+                        f"Attendo {retry_delay_s}s prima del prossimo tentativo "
+                        f"(controlla l'app SPID per la prossima notifica push)"
+                    )
+                    await asyncio.sleep(retry_delay_s)
+            except Exception as e:
+                # Errori non-timeout (credenziali errate, browser crash, ecc.):
+                # fail-fast, non ritentare.
+                logger.error(f"Errore non recuperabile durante il login: {e}")
+                self.authenticated = False
+                raise AuthenticationError(f"Login failed: {e}") from e
+
+        # Esauriti tutti i tentativi su timeout
+        logger.error(f"Login fallito dopo {max_attempts} tentativi: push SPID mai approvata")
+        raise AuthenticationError(
+            f"Login failed after {max_attempts} attempts (push SPID not approved " f"in time): {last_exc}"
+        ) from last_exc
 
     async def start_keep_alive(self):
         """Mantiene la sessione attiva con attività realistiche"""
@@ -243,7 +369,7 @@ class BrowserManager:
             await self.auth_page.goto(
                 "https://sister3.agenziaentrate.gov.it/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_", timeout=30000
             )
-            await self.auth_page.wait_for_load_state("networkidle", timeout=15000)
+            await self.auth_page.wait_for_load_state("domcontentloaded", timeout=15000)
 
             try:
                 provincia_options = await self.auth_page.locator("select[name='listacom'] option").count()
@@ -284,7 +410,7 @@ class BrowserManager:
                 await self.auth_page.goto(
                     "https://sister3.agenziaentrate.gov.it/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_", timeout=30000
                 )
-                await self.auth_page.wait_for_load_state("networkidle", timeout=15000)
+                await self.auth_page.wait_for_load_state("domcontentloaded", timeout=15000)
 
             provincia_options = await self.auth_page.locator("select[name='listacom'] option").count()
             if provincia_options <= 1:
@@ -312,7 +438,7 @@ class BrowserManager:
             await self.auth_page.goto(
                 "https://sister3.agenziaentrate.gov.it/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_", timeout=30000
             )
-            await self.auth_page.wait_for_load_state("networkidle", timeout=15000)
+            await self.auth_page.wait_for_load_state("domcontentloaded", timeout=15000)
             await recovery_logger.log(self.auth_page, "goto_scelta_servizio")
 
             current_url = self.auth_page.url
@@ -384,30 +510,73 @@ class BrowserManager:
                 raise AuthenticationError(f"Re-authentication failed: {e}") from e
 
     async def esegui_visura(self, request: VisuraRequest) -> VisuraResponse:
-        """Esegue una visura catastale (solo dati catastali, senza intestati)"""
+        """Esegue una visura catastale (solo dati catastali, senza intestati).
+
+        Se ``request.fallback_other_catasto`` e' True e il primo tentativo
+        restituisce ``NESSUNA CORRISPONDENZA TROVATA`` (total_results == 0),
+        ritenta automaticamente sull'altro catasto (T<->F) e annota
+        ``tipo_catasto_used`` e ``fallback_used`` nel campo ``data``.
+        """
         try:
             await self._ensure_authenticated()
 
-            try:
-                result = await run_visura(
+            async def _run(tipo: str):
+                return await run_visura(
                     self.auth_page,
                     request.provincia,
                     request.comune,
                     request.sezione,
                     request.foglio,
                     request.particella,
-                    request.tipo_catasto,
+                    tipo,
                     extract_intestati=False,
                     subalterno=request.subalterno,
+                    codice_belfiore=request.codice_belfiore,
                 )
+
+            try:
+                result = await _run(request.tipo_catasto)
             except Exception as e:
                 raise BrowserError(f"Failed to execute visura: {e}") from e
 
-            logger.info(f"Visura completata per request {request.request_id}")
+            tipo_used = request.tipo_catasto
+            fallback_used = False
+            # Detect "not found": run_visura ritorna esplicitamente
+            # error="NESSUNA CORRISPONDENZA TROVATA" e total_results=0 in quel caso.
+            not_found = isinstance(result, dict) and result.get("error") == "NESSUNA CORRISPONDENZA TROVATA"
+            if not_found and request.fallback_other_catasto:
+                other = "F" if request.tipo_catasto == "T" else "T"
+                logger.info(
+                    f"[FALLBACK] {request.request_id}: nessuna corrispondenza in "
+                    f"catasto '{request.tipo_catasto}', riprovo su '{other}'"
+                )
+                try:
+                    fallback_result = await _run(other)
+                except Exception as e:
+                    # Il fallback non deve mascherare il risultato originale: logga e tieni il primo
+                    logger.warning(f"[FALLBACK] fallito su catasto '{other}': {e}")
+                else:
+                    # Adotta il risultato del fallback solo se ha trovato qualcosa
+                    if (
+                        isinstance(fallback_result, dict)
+                        and fallback_result.get("error") != "NESSUNA CORRISPONDENZA TROVATA"
+                    ):
+                        result = fallback_result
+                        tipo_used = other
+                        fallback_used = True
+
+            if isinstance(result, dict):
+                result["tipo_catasto_requested"] = request.tipo_catasto
+                result["tipo_catasto_used"] = tipo_used
+                result["fallback_used"] = fallback_used
+
+            logger.info(
+                f"Visura completata per request {request.request_id} " f"(tipo={tipo_used}, fallback={fallback_used})"
+            )
             return VisuraResponse(
                 request_id=request.request_id,
                 success=True,
-                tipo_catasto=request.tipo_catasto,
+                tipo_catasto=tipo_used,
                 data=result,
             )
 
@@ -442,6 +611,7 @@ class BrowserManager:
                     foglio=request.foglio,
                     particella=request.particella,
                     subalterno=request.subalterno,
+                    codice_belfiore=request.codice_belfiore,
                 )
             else:
                 result = await run_visura(
@@ -453,6 +623,7 @@ class BrowserManager:
                     request.particella,
                     request.tipo_catasto,
                     extract_intestati=True,
+                    codice_belfiore=request.codice_belfiore,
                 )
 
             logger.info(f"Visura intestati completata per {request.request_id}")
@@ -531,10 +702,27 @@ class BrowserManager:
 
 
 class VisuraService:
+    # Difaults configurabili via env (vedi .env.example). Sono qui come costanti
+    # di classe così sono ispezionabili dai test senza istanziare il servizio.
+    DEFAULT_RESPONSE_TTL_SECONDS = 3600  # 1h: tempo medio entro cui il client
+    # consumer fa polling del risultato di una visura.
+    DEFAULT_RESPONSE_MAXSIZE = 10_000  # safety cap: oltre, le entry più vecchie
+    # vengono evicted (LRU dietro il TTL).
+    DEFAULT_QUEUE_MAXSIZE = 200  # backlog massimo; oltre soglia → HTTP 429.
+
     def __init__(self):
         self.browser_manager = BrowserManager()
-        self.request_queue = asyncio.Queue()
-        self.response_store: Dict[str, VisuraResponse] = {}
+
+        queue_max = int(os.getenv("MAX_QUEUE_SIZE", self.DEFAULT_QUEUE_MAXSIZE))
+        # ``asyncio.Queue`` con maxsize=0 è illimitata; usiamo il valore env.
+        self.request_queue: asyncio.Queue = asyncio.Queue(maxsize=queue_max)
+
+        ttl_seconds = int(os.getenv("RESPONSE_TTL_SECONDS", self.DEFAULT_RESPONSE_TTL_SECONDS))
+        maxsize = int(os.getenv("RESPONSE_STORE_MAXSIZE", self.DEFAULT_RESPONSE_MAXSIZE))
+        # TTLCache: ogni entry vive ``ttl_seconds`` poi viene rimossa; se la
+        # cache supera ``maxsize`` evict LRU. Fix memory leak F5.
+        self.response_store: TTLCache = TTLCache(maxsize=maxsize, ttl=ttl_seconds)
+
         self.processing = False
 
     async def initialize(self):
@@ -570,24 +758,40 @@ class VisuraService:
 
                 self.request_queue.task_done()
 
-                # Pausa tra le richieste per non sovraccaricare SISTER
-                await asyncio.sleep(2)
+                # Breve yield al loop per evitare burst su SISTER; il rate-limit
+                # vero è gestito dal token bucket HTTP (P1 #7). Ridotto da 2s
+                # a 0.1s per non aggiungere 2s di latenza inutile su ogni job.
+                await asyncio.sleep(0.1)
 
             except Exception as e:
                 logger.error(f"Errore nel processare richieste: {e}")
                 await asyncio.sleep(5)
 
     async def add_request(self, request: VisuraRequest) -> str:
-        """Aggiunge una richiesta alla coda"""
-        await self.request_queue.put({"request": request})
+        """Aggiunge una richiesta alla coda.
+
+        Solleva ``QueueFullError`` se la coda è piena (vedi
+        ``MAX_QUEUE_SIZE`` env). Gli endpoint la traducono in HTTP 429.
+        """
+        try:
+            self.request_queue.put_nowait({"request": request})
+        except asyncio.QueueFull as e:
+            raise QueueFullError(f"Coda piena (limite {self.request_queue.maxsize}): riprovare più tardi") from e
         logger.info(
             f"Richiesta visura {request.request_id} aggiunta alla coda (posizione: {self.request_queue.qsize()})"
         )
         return request.request_id
 
     async def add_intestati_request(self, request: VisuraIntestatiRequest) -> str:
-        """Aggiunge una richiesta intestati alla coda"""
-        await self.request_queue.put({"request": request})
+        """Aggiunge una richiesta intestati alla coda.
+
+        Solleva ``QueueFullError`` se la coda è piena (vedi
+        ``MAX_QUEUE_SIZE`` env). Gli endpoint la traducono in HTTP 429.
+        """
+        try:
+            self.request_queue.put_nowait({"request": request})
+        except asyncio.QueueFull as e:
+            raise QueueFullError(f"Coda piena (limite {self.request_queue.maxsize}): riprovare più tardi") from e
         logger.info(
             f"Richiesta intestati {request.request_id} aggiunta alla coda (posizione: {self.request_queue.qsize()})"
         )
@@ -630,7 +834,7 @@ def get_visura_service() -> VisuraService:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    global visura_service
+    global visura_service  # noqa: PLW0603 - FastAPI lifespan singleton pattern
     PageLogger.reset_session()  # Nuova sessione di log per ogni avvio
     visura_service = VisuraService()
     await visura_service.initialize()
@@ -655,12 +859,37 @@ api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 
 
 async def verify_api_key(api_key: str = Depends(api_key_header)):
-    """Verifica che l'API Key fornita corrisponda a quella configurata."""
+    """Verifica che l'API Key fornita corrisponda a quella configurata.
+
+    Se la variabile ``API_KEY`` non è impostata in env la protezione è
+    disabilitata per gli endpoint che dipendono da questa funzione (uso "soft":
+    in dev locale è comodo non dover sempre passare la chiave). Per gli
+    endpoint amministrativi usare ``verify_api_key_strict``.
+    """
     expected_key = os.getenv("API_KEY")
     if not expected_key:
-        # Se non è configurata una API Key, la protezione è disabilitata
         return None
-    if api_key != expected_key:
+    if not api_key or not secrets.compare_digest(api_key, expected_key):
+        raise HTTPException(status_code=403, detail="API Key non valida o mancante")
+    return api_key
+
+
+async def verify_api_key_strict(api_key: str = Depends(api_key_header)):
+    """Variante fail-closed di ``verify_api_key`` per endpoint amministrativi.
+
+    Richiede sempre che ``API_KEY`` sia configurata in env e che il client
+    fornisca un header valido: se ``API_KEY`` manca l'endpoint risponde 503
+    (servizio mal configurato) invece di accettare chiamate anonime.
+    """
+    expected_key = os.getenv("API_KEY")
+    if not expected_key:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Endpoint amministrativo disabilitato: configurare la " "variabile d'ambiente API_KEY per abilitarlo."
+            ),
+        )
+    if not api_key or not secrets.compare_digest(api_key, expected_key):
         raise HTTPException(status_code=403, detail="API Key non valida o mancante")
     return api_key
 
@@ -682,8 +911,27 @@ class VisuraInput(BaseModel):
     tipo_catasto: Optional[str] = Field(
         None, pattern=r"^[TF]$", description="'T' = Terreni, 'F' = Fabbricati (se omesso esegue entrambi)"
     )
+    codice_belfiore: Optional[str] = Field(
+        None,
+        pattern=r"^[A-Za-z]\d{3}$",
+        description=(
+            "Codice belfiore catastale del comune (4 char, lettera + 3 cifre, es. 'H501'). "
+            "Se valorizzato bypassa il match per nome sul dropdown SISTER ed e' piu' robusto "
+            "per comuni con varianti ortografiche tra ISTAT e SISTER."
+        ),
+    )
+    fallback_other_catasto: bool = Field(
+        False,
+        description=(
+            "Se True e il primo tentativo restituisce 'NESSUNA CORRISPONDENZA TROVATA', "
+            "riprova automaticamente sull'altro catasto (T<->F). "
+            "Ha effetto solo se tipo_catasto e' valorizzato esplicitamente; quando tipo_catasto "
+            "e' omesso il backend gia' esegue T e F in parallelo come due richieste separate."
+        ),
+    )
 
-    @validator("tipo_catasto")
+    @field_validator("tipo_catasto")
+    @classmethod
     def validate_tipo_catasto(cls, v):
         if v is not None and v not in ["T", "F"]:
             raise ValidationError(f"tipo_catasto deve essere 'T' o 'F', ricevuto {v}")
@@ -700,16 +948,23 @@ class VisuraIntestatiInput(BaseModel):
     tipo_catasto: str = Field(..., pattern=r"^[TF]$", description="'T' = Terreni, 'F' = Fabbricati")
     subalterno: Optional[str] = Field(None, description="Numero di subalterno (obbligatorio per Fabbricati)")
     sezione: Optional[str] = Field(None, description="Sezione (opzionale)")
+    codice_belfiore: Optional[str] = Field(
+        None,
+        pattern=r"^[A-Za-z]\d{3}$",
+        description="Codice belfiore catastale del comune (vedi VisuraInput.codice_belfiore).",
+    )
 
-    @validator("tipo_catasto")
+    @field_validator("tipo_catasto")
+    @classmethod
     def validate_tipo_catasto(cls, v):
         if v not in ["T", "F"]:
             raise ValidationError(f"tipo_catasto deve essere 'T' o 'F', ricevuto {v}")
         return v
 
-    @validator("subalterno")
-    def validate_subalterno(cls, v, values):
-        tipo_catasto = values.get("tipo_catasto")
+    @field_validator("subalterno")
+    @classmethod
+    def validate_subalterno(cls, v, info):
+        tipo_catasto = info.data.get("tipo_catasto")
         if tipo_catasto == "F" and not v:
             raise ValidationError("subalterno è obbligatorio per i fabbricati (tipo_catasto='F')")
         if tipo_catasto == "T" and v:
@@ -742,6 +997,9 @@ async def richiedi_visura(
         sezione = None if request.sezione == "_" else request.sezione
 
         tipos_catasto = [request.tipo_catasto] if request.tipo_catasto else ["T", "F"]
+        # Il fallback automatico ha senso solo quando l'utente specifica un singolo tipo:
+        # se omette tipo_catasto eseguiamo gia' T e F come richieste parallele indipendenti.
+        fallback_effective = bool(request.fallback_other_catasto) and request.tipo_catasto is not None
         request_ids = []
 
         for tipo_catasto in tipos_catasto:
@@ -755,6 +1013,8 @@ async def richiedi_visura(
                 foglio=request.foglio,
                 particella=request.particella,
                 subalterno=request.subalterno,
+                codice_belfiore=request.codice_belfiore,
+                fallback_other_catasto=fallback_effective,
             )
             await service.add_request(visura_req)
             request_ids.append(request_id)
@@ -770,6 +1030,9 @@ async def richiedi_visura(
 
     except HTTPException:
         raise
+    except QueueFullError as e:
+        logger.warning(f"Coda piena, rifiuto richiesta visura: {e}")
+        raise HTTPException(status_code=429, detail=str(e))
     except Exception as e:
         logger.error(f"Errore nella richiesta visura: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Errore interno del server. Consulta i log per i dettagli.")
@@ -827,6 +1090,7 @@ async def richiedi_intestati_immobile(
             particella=request.particella,
             subalterno=request.subalterno,
             sezione=sezione,
+            codice_belfiore=request.codice_belfiore,
         )
 
         await service.add_intestati_request(intestati_request)
@@ -844,6 +1108,9 @@ async def richiedi_intestati_immobile(
 
     except HTTPException:
         raise
+    except QueueFullError as e:
+        logger.warning(f"Coda piena, rifiuto richiesta intestati: {e}")
+        raise HTTPException(status_code=429, detail=str(e))
     except Exception as e:
         logger.error(f"Errore nella richiesta intestati: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Errore interno del server. Consulta i log per i dettagli.")
@@ -863,7 +1130,8 @@ async def health_check(service: VisuraService = Depends(get_visura_service)):
 
 @app.post("/shutdown")
 async def graceful_shutdown_endpoint(
-    service: VisuraService = Depends(get_visura_service), _key: str = Depends(verify_api_key)
+    service: VisuraService = Depends(get_visura_service),
+    _key: str = Depends(verify_api_key_strict),
 ):
     """Effettua uno shutdown graceful del servizio"""
     try:
@@ -879,7 +1147,7 @@ async def graceful_shutdown_endpoint(
 async def extract_sezioni(
     request: SezioniExtractionRequest,
     service: VisuraService = Depends(get_visura_service),
-    _key: str = Depends(verify_api_key),
+    _key: str = Depends(verify_api_key_strict),
 ):
     """
     Estrae le sezioni territoriali d'Italia per il tipo catasto specificato.

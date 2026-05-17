@@ -2,10 +2,12 @@
 # Copyright (C) 2026 zornade (https://zornade.com)
 # See LICENSE, NOTICE, and COMMERCIAL-LICENSE.md at the repository root.
 
+import asyncio
 import logging
 import os
 import re
 import time
+import unicodedata
 from datetime import datetime
 from typing import Optional
 
@@ -79,7 +81,9 @@ def parse_table(html):
             # Se ci sono meno celle che header, aggiungi celle vuote
             while len(cells) < len(headers):
                 cells.append("")
-            rows.append(dict(zip(headers, cells)))
+            # strict=False: cells is pre-padded to len(headers); extra cells
+            # (rare: malformed HTML with more <td> than <th>) are intentionally dropped.
+            rows.append(dict(zip(headers, cells, strict=False)))
     return rows
 
 
@@ -140,8 +144,15 @@ class PageLogger:
             self.base_dir = None
 
     async def log(self, page: Page, step_name: str) -> None:
-        """Salva l'HTML corrente della pagina su disco (no-op se disabilitato)."""
+        """Salva l'HTML corrente della pagina su disco (no-op se disabilitato).
+
+        Disabilitabile via env ``LOG_PAGES=0`` (default: ``1``). Quando off,
+        ritorna immediatamente senza chiamare ``page.content()`` né scrivere
+        su disco — riduce ~0.5-2s/richiesta su success path.
+        """
         self.step += 1
+        if os.getenv("LOG_PAGES", "1") != "1":
+            return
         if self.base_dir is None:
             return
         try:
@@ -157,11 +168,22 @@ class PageLogger:
             safe_name = re.sub(r"[^\w\-]", "_", step_name)
             filename = f"{self.step:02d}_{safe_name}.html"
             filepath = os.path.join(self.base_dir, filename)
-            with open(filepath, "w", encoding="utf-8") as f:
-                f.write(f"<!-- URL: {url} -->\n")
-                f.write(f"<!-- Step: {step_name} -->\n")
-                f.write(f"<!-- Timestamp: {datetime.now().isoformat()} -->\n\n")
-                f.write(html)
+            # Write off the event loop: open()/write() are blocking syscalls
+            # and were previously freezing the asyncio loop for the duration
+            # of the disk write (ASYNC230). We use asyncio.to_thread so any
+            # I/O slowness (e.g. EBS, full disk) cannot starve the loop.
+            payload = (
+                f"<!-- URL: {url} -->\n"
+                f"<!-- Step: {step_name} -->\n"
+                f"<!-- Timestamp: {datetime.now().isoformat()} -->\n\n"
+                f"{html}"
+            )
+
+            def _write_file() -> None:
+                with open(filepath, "w", encoding="utf-8") as f:
+                    f.write(payload)
+
+            await asyncio.to_thread(_write_file)
             print(f"[PAGE_LOG] {self.flow_name}/{filename}")
         except Exception as e:
             print(f"[PAGE_LOG] Errore salvataggio {step_name}: {e}")
@@ -218,6 +240,30 @@ async def _login_sielte(page: Page, logger: PageLogger, username: str, password:
         await logger.log(page, "notifica_push")
 
         step = "autorizza"
+        # Fail-fast: il pulsante 'Autorizza' appare solo se username/password
+        # sono corretti e l'autenticazione e' arrivata allo step push. Se le
+        # credenziali sono sbagliate la pagina rimane sulla form di login con
+        # un messaggio d'errore: in tal caso vogliamo fallire entro pochi
+        # secondi invece di aspettare 120s. Soglia configurabile via env
+        # ``LOGIN_AUTORIZZA_APPEAR_TIMEOUT_S`` (default 15).
+        appear_timeout_s = int(os.getenv("LOGIN_AUTORIZZA_APPEAR_TIMEOUT_S", "15"))
+        print(
+            f"[LOGIN] Attendo pulsante 'Autorizza' (max {appear_timeout_s}s) — "
+            f"se non appare = credenziali probabilmente errate"
+        )
+        try:
+            await page.get_by_role("button", name="Autorizza").wait_for(
+                state="visible", timeout=appear_timeout_s * 1000
+            )
+        except PlaywrightTimeoutError as e:
+            current_url = page.url
+            await logger.log(page, f"ERRORE_sielte_{step}_autorizza_non_apparso")
+            raise RuntimeError(
+                f"Login Sielte fallito: pulsante 'Autorizza' non apparso entro "
+                f"{appear_timeout_s}s. Credenziali probabilmente errate o flusso "
+                f"Sielte modificato. URL corrente: {current_url}"
+            ) from e
+
         print("[LOGIN] Clicco 'Autorizza'... (attendo conferma notifica push, timeout 120s)")
         await page.get_by_role("button", name="Autorizza").click(timeout=120000)
         await logger.log(page, "autorizza")
@@ -258,6 +304,33 @@ async def _login_poste(page: Page, logger: PageLogger, username: str, password: 
         await logger.log(page, "avanti")
 
         step = "attesa_app"
+        # Fail-fast: dopo 'Avanti' PosteID transita a uno step di approvazione
+        # push e poi reindirizza al dominio agenziaentrate. Se username/password
+        # sono sbagliate la pagina mostra subito un errore senza mai partire la
+        # push; aspettare 120s prima di accorgersene non e' utile. Diamo prima
+        # ``LOGIN_POSTE_PUSH_APPEAR_TIMEOUT_S`` per il cambio di URL/stato e
+        # poi il timeout lungo per l'approvazione vera e propria.
+        appear_timeout_s = int(os.getenv("LOGIN_POSTE_PUSH_APPEAR_TIMEOUT_S", "15"))
+        print(
+            f"[LOGIN] Attendo transizione push PosteID (max {appear_timeout_s}s) — "
+            f"se rimane sulla form = credenziali probabilmente errate"
+        )
+        try:
+            # Attendiamo che l'URL CAMBI dalla pagina di login. wait_for_url
+            # con un pattern wildcard fallisce se restiamo sullo stesso URL.
+            await page.wait_for_function(
+                "url => !window.location.href.includes('login') && !window.location.href.includes('Login')",
+                timeout=appear_timeout_s * 1000,
+            )
+        except PlaywrightTimeoutError as e:
+            current_url = page.url
+            await logger.log(page, f"ERRORE_poste_{step}_push_non_partita")
+            raise RuntimeError(
+                f"Login PosteID fallito: la pagina non e' uscita dal form di login "
+                f"entro {appear_timeout_s}s. Credenziali probabilmente errate o "
+                f"flusso PosteID modificato. URL corrente: {current_url}"
+            ) from e
+
         print("[LOGIN] Attendo approvazione sull'app PosteID (timeout 120s)...")
         # PosteID reindirizza automaticamente dopo l'approvazione sull'app:
         # aspettiamo che il browser torni sul dominio agenziaentrate.
@@ -354,7 +427,7 @@ async def login(page: Page):
 
         step = "controllo_sessione"
         print("[LOGIN] Attendo caricamento pagina...")
-        await page.wait_for_load_state("networkidle")
+        await page.wait_for_load_state("domcontentloaded")
         await logger.log(page, "vai_al_servizio")
         print("[LOGIN] Controllo blocco sessione...")
         content = await page.content()
@@ -429,28 +502,39 @@ async def _login_sister_direct(page: Page, logger: PageLogger, username: str, pa
 
         step = "attesa_sister"
         print("[LOGIN] Attendo caricamento portale SISTER...")
-        await page.wait_for_load_state("networkidle", timeout=30000)
+        await page.wait_for_load_state("domcontentloaded", timeout=30000)
         await logger.log(page, "portale_sister")
 
         # Gestione sessioni orfane: ogni CloseSessionsSis chiude UNA sessione
         # stale. Dopo molti riavvii possono accumularsi più sessioni, perciò
-        # proviamo fino a 10 volte prima di alzare l'eccezione.
-        for attempt in range(1, 11):
-            content = await page.content()
-            url = page.url
-            if "Utente gia' in sessione" not in content and "error_locked.jsp" not in url:
-                break
+        # proviamo fino a MAX_CLOSE_ATTEMPTS volte prima di alzare l'eccezione.
+        # NB: la struttura `for/else` precedente aveva un off-by-one: dopo
+        # l'N-esimo close+retry il loop terminava senza ricontrollare se la
+        # sessione era stata liberata, quindi sollevava errore anche quando in
+        # realtà l'ultimo tentativo era riuscito. Ora il check è esplicito sia
+        # in testa al loop che dopo l'ultimo close.
+        MAX_CLOSE_ATTEMPTS = 10
 
-            print(f"[LOGIN] Sessione orfana rilevata (tentativo {attempt}/10) — chiudo e riprovo...")
-            step = f"close_session_{attempt}"
+        def _is_orphan(content: str, current_url: str) -> bool:
+            return "Utente gia' in sessione" in content or "error_locked.jsp" in current_url
+
+        content = await page.content()
+        url = page.url
+        attempts_done = 0
+        while _is_orphan(content, url) and attempts_done < MAX_CLOSE_ATTEMPTS:
+            attempts_done += 1
+            print(
+                f"[LOGIN] Sessione orfana rilevata (tentativo {attempts_done}/{MAX_CLOSE_ATTEMPTS}) — chiudo e riprovo..."
+            )
+            step = f"close_session_{attempts_done}"
             await page.goto(
                 "https://sister3.agenziaentrate.gov.it/Servizi/CloseSessionsSis",
                 timeout=30000,
             )
             await page.wait_for_load_state("domcontentloaded", timeout=30000)
-            await logger.log(page, f"close_session_{attempt}")
+            await logger.log(page, f"close_session_{attempts_done}")
 
-            step = f"sister_tab_retry_{attempt}"
+            step = f"sister_tab_retry_{attempts_done}"
             await page.goto(
                 "https://iampe.agenziaentrate.gov.it/sam/UI/Login?realm=/agenziaentrate",
                 timeout=30000,
@@ -460,11 +544,17 @@ async def _login_sister_direct(page: Page, logger: PageLogger, username: str, pa
             await page.get_by_role("textbox", name="Utente:").fill(username)
             await page.get_by_role("textbox", name="Password:").fill(password)
             await page.get_by_role("button", name="Accedi").click()
-            await page.wait_for_load_state("networkidle", timeout=30000)
-            await logger.log(page, f"portale_sister_retry_{attempt}")
-        else:
+            await page.wait_for_load_state("domcontentloaded", timeout=30000)
+            await logger.log(page, f"portale_sister_retry_{attempts_done}")
+
+            content = await page.content()
+            url = page.url
+
+        if _is_orphan(content, url):
             print("[LOGIN][ERRORE] Troppe sessioni orfane, impossibile liberare la sessione.")
-            raise Exception("Utente già in sessione su un'altra postazione (max 10 tentativi raggiunto)")
+            raise Exception(
+                f"Utente già in sessione su un'altra postazione (max {MAX_CLOSE_ATTEMPTS} tentativi raggiunto)"
+            )
 
         print("[LOGIN] Login SISTER completato.")
 
@@ -473,18 +563,375 @@ async def _login_sister_direct(page: Page, logger: PageLogger, username: str, pa
         raise
 
 
-async def find_best_option_match(page, selector, search_text):
-    """Trova l'opzione che meglio corrisponde al testo cercato"""
-    options = await page.locator(f"{selector} option").all()
+# Mappa di alias catastali per province con nome ISTAT divergente dal nome
+# usato da SISTER. Chiavi e valori sono già normalizzati con
+# ``_normalize_for_match``. Estendere qui se emergono nuovi casi.
+_CATASTAL_PROVINCE_ALIASES = {
+    "verbano cusio ossola": "verbania",
+    # ISTAT "Monza e della Brianza" (istituita 2009): SISTER non la espone come
+    # ufficio provinciale catastale separato — i comuni della Brianza restano
+    # catastalmente sotto "MILANO Territorio" (confermato bulk-test
+    # 2026-05-15, p.es. Misinto, Lissone). Vedi anche _UNSUPPORTED_PROVINCES.
+    "monza e della brianza": "milano",
+    "forli cesena": "forli",
+    # ISTAT usa "Reggio nell'Emilia", SISTER espone solo "REGGIO EMILIA"
+    # (confermato sperimentalmente, vedi AUDIT_REPORT_2026-05-15.md)
+    "reggio nell emilia": "reggio emilia",
+    # Sud Sardegna è stata istituita nel 2016 ma SISTER (catasto) la mappa
+    # ancora sotto CAGLIARI Territorio (es. Carloforte, Buggerru, Iglesias,
+    # Senorbì). Scoperto nel bulk-test 89 particelle del 2026-05-15.
+    "sud sardegna": "cagliari",
+    # ISTAT usa "Pesaro e Urbino", SISTER espone solo "PESARO Territorio".
+    "pesaro e urbino": "pesaro",
+    # ISTAT "Valle d'Aosta/Vallée d'Aoste" (forma bilingue): SISTER ha
+    # solo "AOSTA Territorio". Scoperto nel bulk-test 97 particelle del
+    # 2026-05-15 (Pont-Saint-Martin, Arvier, Champorcher).
+    "valle d aosta vallee d aoste": "aosta",
+    "valle d aosta": "aosta",
+    "vallee d aoste": "aosta",
+}
+
+
+# Province che SISTER NON espone perché il catasto è gestito da un sistema
+# regionale separato (Sistema Tavolare austriaco) o perché l'ufficio non è
+# stato mai disaggregato. Le richieste per queste province falliscono in modo
+# esplicito con un messaggio attionable, invece di esaurire il timeout sul
+# matching della dropdown.
+#
+# Chiavi normalizzate con ``_normalize_for_match``. Estendere se emergono
+# nuovi casi confermati sperimentalmente.
+_UNSUPPORTED_PROVINCES_SISTER = {
+    # Provincia Autonoma di Trento — Catasto Tavolare (Libro Fondiario)
+    "trento": "Provincia Autonoma di Trento: catasto gestito dal Sistema "
+    "Tavolare (Libro Fondiario), non disponibile su SISTER.",
+    # Provincia Autonoma di Bolzano / Südtirol — Catasto Tavolare
+    "bolzano": "Provincia Autonoma di Bolzano: catasto gestito dal Sistema "
+    "Tavolare (Libro Fondiario), non disponibile su SISTER.",
+    "bolzano bozen": "Provincia Autonoma di Bolzano: catasto gestito dal "
+    "Sistema Tavolare (Libro Fondiario), non disponibile "
+    "su SISTER.",
+}
+
+
+def _normalize_for_match(value: str) -> str:
+    """Normalizza una stringa per matching tollerante in ``find_best_option_match``.
+
+    Operazioni applicate (in ordine):
+      1. ``NFKD`` + drop dei combining marks (rimuove accenti à→a, ù→u, ...);
+      2. apostrofi tipografici ``’`` e backtick mappati ad ASCII;
+      3. apostrofi/punteggiatura/separatori (``-``, ``_``, ``/``, ``'``, ...)
+         convertiti in spazio;
+      4. lowercase;
+      5. rimozione del suffisso `` territorio`` (SISTER lo aggiunge alle
+         province, es. ``ALESSANDRIA Territorio``);
+      6. collasso whitespace multipli e strip.
+    """
+    if not value:
+        return ""
+    nfkd = unicodedata.normalize("NFKD", value)
+    no_marks = "".join(ch for ch in nfkd if not unicodedata.combining(ch))
+    no_marks = no_marks.replace("’", "'").replace("`", "'")
+    cleaned = re.sub(r"[-_/'.,]+", " ", no_marks)
+    lowered = cleaned.lower()
+    lowered = re.sub(r"\bterritorio\b", " ", lowered)
+    return re.sub(r"\s+", " ", lowered).strip()
+
+
+# =============================================================================
+# Dropdown options: estrazione fast (single page.evaluate) + cache process-wide
+# =============================================================================
+#
+# Motivazione perf:
+#   Il pattern originale ``page.locator(sel).all()`` + N×(``get_attribute`` +
+#   ``inner_text``) costa 2N round-trip CDP. Con ~110 province o ~300 comuni
+#   sono 600-1800ms di IPC puro per ogni richiesta. ``page.evaluate`` esegue
+#   un singolo round-trip e ritorna l'array completo in JSON (≪100ms).
+#
+# Cache:
+#   - ``_DROPDOWN_CACHE[("province",)]`` → {"items": [(value, text)], "by_norm": {…}}
+#     Province: stabili nel tempo (cambiano <1/anno). Una volta caricate, riusate
+#     per tutta la vita del processo.
+#   - ``_DROPDOWN_CACHE[("comune", provincia_value)]`` →
+#     {"items": [(value, text)], "by_belfiore": {CB: value}, "by_norm": {norm: value}}
+#     Comuni per provincia: anch'essi stabili (catastalmente). Cache per-provincia.
+#
+# Diagnostica:
+#   - ``[OPTS]`` log ogni estrazione live con count + elapsed.
+#   - ``[CACHE hit|miss|STALE|disabled]`` ogni accesso alla cache.
+#   - Kill switch: ``DROPDOWN_CACHE=0`` disabilita interamente la cache (fallback
+#     a estrazione live ogni volta, ma comunque con ``_collect_options_fast``).
+#   - In caso di failure su ``select_option`` chiamare ``invalidate_dropdown_cache``
+#     per forzare un refetch alla richiesta successiva.
+
+_DROPDOWN_CACHE: dict = {}
+
+
+async def _wait_for_ready(page, selector: str, timeout_ms: int = 15000, label: str = "") -> None:
+    """Attende che ``selector`` sia presente (``attached``) nel DOM.
+
+    Sostituisce il pattern ``wait_for_load_state("domcontentloaded")`` quando
+    il vero "ready" del passo è la presenza di un elemento target specifico
+    (es. la prossima ``<select>`` del form, il link "Immobile"). Ritorna
+    appena il selector è ATTACHED nel DOM (non richiede visibility) — questo
+    è sufficiente per gli step successivi (``select_option``, ``click``,
+    ``page.evaluate`` per estrarre option) che fanno auto-wait di visibility
+    se serve, e copre i casi in cui SISTER nasconde temporaneamente l'elemento
+    durante transitions server-side. Lo stato ``visible`` è troppo stretto e
+    causa timeout su intermittenze di rendering (regressione live osservata
+    2026-05-15: 6 timeout su 97 req).
+
+    Timeout default 15s (vs 30s di ``wait_for_load_state``) per fail-fast su
+    pagine che non caricano. Diagnostica: stampa
+    ``[WAIT] label='...' selector='...' elapsed=Yms`` per grep delle latenze.
+    In caso di timeout l'eccezione Playwright fa propagare il contesto al
+    chiamante.
+    """
+    t0 = time.time()
+    try:
+        await page.wait_for_selector(selector, state="attached", timeout=timeout_ms)
+    finally:
+        elapsed_ms = (time.time() - t0) * 1000
+        print(f"[WAIT] label='{label}' selector='{selector}' elapsed={elapsed_ms:.0f}ms")
+
+
+def _dropdown_cache_enabled() -> bool:
+    return os.getenv("DROPDOWN_CACHE", "1") == "1"
+
+
+def invalidate_dropdown_cache(reason: str = "") -> None:
+    """Svuota la cache delle dropdown SISTER.
+
+    Chiamare quando un ``select_option`` fallisce con un valore preso dalla
+    cache (cache stale), o su restart browser/recovery sessione. Stampa il
+    motivo per diagnostica (grep ``[CACHE] invalidate``).
+    """
+    n = len(_DROPDOWN_CACHE)
+    _DROPDOWN_CACHE.clear()
+    print(f"[CACHE] invalidate cleared={n} reason={reason or 'unspecified'}")
+
+
+async def _collect_options_fast(page, selector: str) -> list:
+    """Estrae tutte le ``<option>`` di ``selector`` in un solo round-trip CDP.
+
+    Ritorna lista di tuple ``(value, text)``. Sostituisce il pattern
+    ``locator(...).all()`` + N×``get_attribute``/``inner_text`` (2N round-trip).
+    Lascia trasparire le eccezioni Playwright al chiamante per non mascherare
+    bug strutturali (selector errato, pagina chiusa, ecc.).
+    """
+    t0 = time.time()
+    raw = await page.evaluate(
+        """sel => Array.from(document.querySelectorAll(sel + ' option'))
+                    .map(o => [o.value || '', (o.textContent || '').trim()])""",
+        selector,
+    )
+    # raw è una lista di liste [value, text]; normalizza a tuple di str
+    items = [(str(v or ""), str(t or "")) for v, t in raw]
+    elapsed_ms = (time.time() - t0) * 1000
+    print(f"[OPTS] selector='{selector}' count={len(items)} source=evaluate elapsed={elapsed_ms:.0f}ms")
+    return items
+
+
+def _build_comune_indexes(items: list) -> dict:
+    """Costruisce indici lookup per i comuni: by codice belfiore e by nome normalizzato.
+
+    ``items`` è la lista (value, text) ritornata da ``_collect_options_fast``.
+    Le option SISTER hanno ``value`` nella forma ``CB#NOME#0#0`` (es. ``H501#ROMA#0#0``).
+    """
+    by_belfiore: dict = {}
+    by_norm: dict = {}
+    for value, text in items:
+        if not value:
+            continue
+        # codice belfiore: prefisso prima del primo '#'
+        prefix = value.split("#", 1)[0].upper().strip()
+        if prefix and prefix not in by_belfiore:
+            by_belfiore[prefix] = value
+        if text:
+            norm = _normalize_for_match(text)
+            if norm and norm not in by_norm:
+                by_norm[norm] = value
+    return {"items": items, "by_belfiore": by_belfiore, "by_norm": by_norm}
+
+
+def _build_province_indexes(items: list) -> dict:
+    """Costruisce indici lookup per le province: solo by nome normalizzato."""
+    by_norm: dict = {}
+    for value, text in items:
+        if not value or not text:
+            continue
+        norm = _normalize_for_match(text)
+        if norm and norm not in by_norm:
+            by_norm[norm] = value
+    return {"items": items, "by_norm": by_norm}
+
+
+def _format_options_for_debug(items: list) -> list:
+    """Ritorna lista 'text (value)' per le print di diagnostica 'disponibili'.
+
+    ``items`` è il valore ritornato da ``_collect_options_fast``.
+    Filtra entry con value o text vuoto. Usato per costruire il messaggio di
+    errore quando una option non viene trovata: l'output coincide con il
+    formato originale (`f"{text} ({value})"`).
+    """
+    return [f"{t} ({v})" for v, t in items if v and t]
+
+
+async def _get_province_options(page) -> dict:
+    """Ritorna gli indici delle province SISTER, cache process-wide se abilitata."""
+    selector = "select[name='listacom']"
+    if _dropdown_cache_enabled():
+        cached = _DROPDOWN_CACHE.get(("province",))
+        if cached is not None:
+            print(f"[CACHE] hit kind=province count={len(cached['items'])}")
+            return cached
+        print("[CACHE] miss kind=province fetching live")
+    else:
+        print("[CACHE] disabled kind=province (DROPDOWN_CACHE=0)")
+    items = await _collect_options_fast(page, selector)
+    idx = _build_province_indexes(items)
+    if _dropdown_cache_enabled():
+        _DROPDOWN_CACHE[("province",)] = idx
+        print(f"[CACHE] store kind=province count={len(items)}")
+    return idx
+
+
+async def _get_comune_options(page, provincia_value: Optional[str]) -> dict:
+    """Ritorna gli indici dei comuni per ``provincia_value``.
+
+    Cache key = ``("comune", provincia_value)``. **IMPORTANTE**: la cache è
+    abilitata SOLO se ``provincia_value`` è truthy (es. ``"MANTOVA Territorio-MN"``).
+    Se è ``None`` o stringa vuota, NON cachiamo: i comuni cambiano per provincia
+    e una chiave condivisa ``""`` causerebbe cross-province poisoning (regressione
+    osservata 2026-05-15: Mantova 73 comuni → riusati per Savona/Pesaro/...).
+    Il chiamante legacy che non conosce provincia_value paga il singolo evaluate
+    per fetch (comunque rapido, ~3-5ms).
+    """
+    selector = "select[name='denomComune']"
+    cache_ok = bool(provincia_value) and _dropdown_cache_enabled()
+    if cache_ok:
+        key = ("comune", provincia_value)
+        cached = _DROPDOWN_CACHE.get(key)
+        if cached is not None:
+            print(f"[CACHE] hit kind=comune provincia='{provincia_value}' " f"count={len(cached['items'])}")
+            return cached
+        print(f"[CACHE] miss kind=comune provincia='{provincia_value}' fetching live")
+    elif not provincia_value:
+        # Path legacy: nessuna cache possibile (key collision risk)
+        pass
+    else:
+        print("[CACHE] disabled kind=comune (DROPDOWN_CACHE=0)")
+    items = await _collect_options_fast(page, selector)
+    idx = _build_comune_indexes(items)
+    if cache_ok:
+        _DROPDOWN_CACHE[("comune", provincia_value)] = idx
+        print(f"[CACHE] store kind=comune provincia='{provincia_value}' count={len(items)}")
+    return idx
+
+
+async def find_option_by_codice_belfiore(
+    page,
+    selector: str,
+    codice_belfiore: str,
+    provincia_value: Optional[str] = None,
+) -> Optional[str]:
+    """Trova un'option SISTER il cui ``value`` inizia con ``{codice_belfiore}#``.
+
+    Le option di ``select[name='denomComune']`` in SISTER hanno valore nella
+    forma ``CODICEBELFIORE#NOME#0#0`` (es. ``A737#BELFIORE#0#0``,
+    ``H501#ROMA#0#0``). Quando il consumer conosce il codice belfiore catastale
+    (es. da ``parcels.administrativeunit``) può evitare il match stringa sul
+    nome del comune — più robusto perché il codice belfiore è una chiave
+    catastale stabile, mentre i nomi soffrono di varianti ortografiche
+    (apostrofi tipografici, accenti, suffissi).
+
+    Ritorna il ``value`` dell'option oppure ``None`` se nessuna option
+    nel ``select`` ha quel prefisso.
+
+    Implementazione (perf): usa ``_collect_options_fast`` (singolo evaluate)
+    con cache per-provincia se ``provincia_value`` è valorizzato (passare il
+    value della provincia già selezionata permette di cachare i comuni della
+    provincia corrente in modo sicuro, senza cross-province poisoning). Se
+    il selector non è quello dei comuni SISTER fa fallback a un evaluate
+    diretto senza cache.
+    """
+    if not codice_belfiore:
+        return None
+    cb = codice_belfiore.strip().upper()
+    if not cb:
+        return None
+    prefix = f"{cb}#"
+    # Path veloce con cache per il selector standard dei comuni
+    if selector == "select[name='denomComune']":
+        idx = await _get_comune_options(page, provincia_value=provincia_value)
+        value = idx["by_belfiore"].get(cb)
+        if value:
+            print(f"[MATCH_BELFIORE] hit cache cb='{cb}' -> '{value}'")
+            return value
+        # No-hit: log e ritorna None (caller fa fallback su match by name)
+        print(f"[MATCH_BELFIORE] miss cb='{cb}' tra {len(idx['items'])} option " f"(comuni provincia corrente)")
+        return None
+    # Path generico (no cache): un solo evaluate + scan
+    items = await _collect_options_fast(page, selector)
+    print(f"[MATCH_BELFIORE] Cerco codice belfiore '{cb}' tra {len(items)} option (no-cache)")
+    for value, text in items:
+        if value and value.upper().startswith(prefix):
+            print(f"[MATCH_BELFIORE] Match: '{text}' -> '{value}'")
+            return value
+    print(f"[MATCH_BELFIORE] Nessuna option con prefisso '{prefix}'")
+    return None
+
+
+async def find_best_option_match(page, selector, search_text, provincia_value: Optional[str] = None):
+    """Trova l'opzione che meglio corrisponde al testo cercato.
+
+    Il matching è tollerante a:
+      - case (uppercase/lowercase),
+      - accenti (à/è/ì/ò/ù → a/e/i/o/u),
+      - apostrofi tipografici vs ASCII (’ vs '),
+      - separatori (-, _, /) trattati come spazi,
+      - suffissi specifici di SISTER come " Territorio" sulle province,
+      - alias catastali per province con nome divergente da ISTAT
+        (es. "Verbano-Cusio-Ossola" → "Verbania").
+
+    L'ordine di priorità del matching è: exact value → exact text → starts-with
+    → contains → match dell'alias catastale. Restituisce il ``value``
+    dell'option scelta, oppure ``None`` se nessuna opzione è plausibile.
+
+    ``provincia_value`` (opzionale) è usato solo quando ``selector`` è
+    ``select[name='denomComune']``: passarlo abilita la cache comune
+    scope-per-provincia in modo sicuro (evita cross-province poisoning).
+    """
+    # Estrazione fast (single evaluate) + cache process-wide per i selector standard
+    if selector == "select[name='listacom']":
+        idx = await _get_province_options(page)
+        items = idx["items"]
+        # Tentativo lookup O(1) sulla cache by normalized name
+        search_norm_pre = _normalize_for_match(search_text)
+        if search_norm_pre and search_norm_pre in idx["by_norm"]:
+            v = idx["by_norm"][search_norm_pre]
+            print(f"[MATCH] CACHE hit provincia '{search_text}' -> '{v}'")
+            return v
+    elif selector == "select[name='denomComune']":
+        idx = await _get_comune_options(page, provincia_value=provincia_value)
+        items = idx["items"]
+        search_norm_pre = _normalize_for_match(search_text)
+        if search_norm_pre and search_norm_pre in idx["by_norm"]:
+            v = idx["by_norm"][search_norm_pre]
+            print(f"[MATCH] CACHE hit comune '{search_text}' -> '{v}'")
+            return v
+    else:
+        # Selector non standard (es. select[name='sezione']) — solo evaluate, no cache
+        items = await _collect_options_fast(page, selector)
+
     best_match = None
     best_score = 0
 
-    print(f"[MATCH] Cerco '{search_text}' tra {len(options)} opzioni")
+    print(f"[MATCH] Cerco '{search_text}' tra {len(items)} opzioni (post-fast)")
 
-    for option in options:
-        value = await option.get_attribute("value")
-        text = await option.inner_text()
+    search_norm = _normalize_for_match(search_text)
+    search_alias = _CATASTAL_PROVINCE_ALIASES.get(search_norm)
 
+    for value, text in items:
         if not value or not text:
             continue
 
@@ -492,40 +939,56 @@ async def find_best_option_match(page, selector, search_text):
         search_upper = search_text.upper()
         text_upper = text.upper()
         value_upper = value.upper()
+        text_norm = _normalize_for_match(text)
+        value_norm = _normalize_for_match(value)
 
         # PRIORITÀ 1: Exact match del valore (per sezioni come P, Q, etc.)
-        if search_upper == value_upper:
+        if search_upper == value_upper or search_norm == value_norm:
             print(f"[MATCH] Exact value match trovato: '{text}' -> '{value}'")
             return value
 
-        # PRIORITÀ 2: Exact match del testo
-        if search_upper == text_upper:
+        # PRIORITÀ 2: Exact match del testo (incluso match normalizzato senza
+        # accenti/apostrofi/suffisso " Territorio")
+        if search_upper == text_upper or search_norm == text_norm:
             print(f"[MATCH] Exact text match trovato: '{text}' -> '{value}'")
             return value
 
         # PRIORITÀ 3: Match che inizia con il testo cercato
-        if text_upper.startswith(search_upper):
-            score = len(search_text) / len(text)
+        if text_upper.startswith(search_upper) or text_norm.startswith(search_norm):
+            score = len(search_norm) / max(len(text_norm), 1)
             if score > best_score:
                 best_score = score
                 best_match = value
                 print(f"[MATCH] Candidato (starts with): '{text}' -> '{value}' (score: {score:.2f})")
+            continue
 
         # PRIORITÀ 4: Value che inizia con il testo cercato
-        elif value_upper.startswith(search_upper):
-            score = len(search_text) / len(value) * 0.9  # Leggera penalità
+        if value_upper.startswith(search_upper) or value_norm.startswith(search_norm):
+            score = len(search_norm) / max(len(value_norm), 1) * 0.9
             if score > best_score:
                 best_score = score
                 best_match = value
                 print(f"[MATCH] Candidato (value starts with): '{text}' -> '{value}' (score: {score:.2f})")
+            continue
 
         # PRIORITÀ 5: Match che contiene il testo cercato
-        elif search_upper in text_upper:
-            score = len(search_text) / len(text) * 0.6  # Maggiore penalità per evitare falsi positivi
+        if search_upper in text_upper or (search_norm and search_norm in text_norm):
+            score = len(search_norm) / max(len(text_norm), 1) * 0.6
             if score > best_score:
                 best_score = score
                 best_match = value
                 print(f"[MATCH] Candidato (contains): '{text}' -> '{value}' (score: {score:.2f})")
+            continue
+
+        # PRIORITÀ 6: Alias catastale (es. Verbano-Cusio-Ossola → Verbania)
+        if search_alias and (
+            text_norm == search_alias or text_norm.startswith(search_alias) or search_alias in text_norm
+        ):
+            score = len(search_alias) / max(len(text_norm), 1) * 0.5
+            if score > best_score:
+                best_score = score
+                best_match = value
+                print(f"[MATCH] Candidato (alias '{search_alias}'): '{text}' -> '{value}' (score: {score:.2f})")
 
     if best_match:
         print(f"[MATCH] Migliore match trovato: '{best_match}' (score: {best_score:.2f})")
@@ -545,6 +1008,7 @@ async def run_visura(
     tipo_catasto="T",
     extract_intestati=True,
     subalterno=None,
+    codice_belfiore: Optional[str] = None,
 ):
     time0 = time.time()
     logger = PageLogger("visura")
@@ -554,13 +1018,20 @@ async def run_visura(
         f"[VISURA] Inizio visura: provincia={provincia}, comune={comune}{sezione_info}, foglio={foglio}, particella={particella}{subalterno_info}, tipo_catasto={tipo_catasto}"
     )
 
+    # Fail-fast su province non supportate (Trento/Bolzano: Catasto Tavolare).
+    # Evita di navigare SISTER inutilmente e restituisce un errore actionable.
+    provincia_norm = _normalize_for_match(provincia)
+    unsupported_reason = _UNSUPPORTED_PROVINCES_SISTER.get(provincia_norm)
+    if unsupported_reason:
+        raise Exception(unsupported_reason)
+
     # Non creare una nuova pagina, usa quella esistente
     print("[VISURA] Utilizzando pagina di autenticazione esistente")
 
     # STEP 1: Selezione Ufficio Provinciale
     print("[VISURA] Navigando alla pagina di scelta servizio...")
     await page.goto("https://sister3.agenziaentrate.gov.it/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_", timeout=60000)
-    await page.wait_for_load_state("networkidle", timeout=30000)
+    await _wait_for_ready(page, "select[name='listacom']", label="visura_scelta_servizio")
     print("[VISURA] Pagina caricata")
     await logger.log(page, "scelta_servizio")
 
@@ -588,14 +1059,9 @@ async def run_visura(
     # Trova e seleziona la provincia corretta
     print(f"[VISURA] Cercando provincia: {provincia}")
 
-    # Prima estrai tutte le province disponibili per debug
-    provincia_options = await page.locator("select[name='listacom'] option").all()
-    available_provinces = []
-    for option in provincia_options:
-        value = await option.get_attribute("value")
-        text = await option.inner_text()
-        if value and text:
-            available_provinces.append(f"{text} ({value})")
+    # Prima estrai tutte le province disponibili per debug (single evaluate via helper)
+    _prov_items = await _collect_options_fast(page, "select[name='listacom']")
+    available_provinces = _format_options_for_debug(_prov_items)
 
     # Se non ci sono province disponibili, probabilmente la sessione è scaduta
     if len(available_provinces) == 0:
@@ -621,14 +1087,18 @@ async def run_visura(
 
     print("[VISURA] Cliccando Applica...")
     await page.locator("input[type='submit'][value='Applica']").click()
-    await page.wait_for_load_state("networkidle", timeout=30000)
+    await _wait_for_ready(
+        page,
+        "a:has-text('Immobile'), [role='link']:has-text('Immobile')",
+        label="visura_post_applica",
+    )
     print("[VISURA] Applica cliccato, pagina caricata")
     await logger.log(page, "provincia_applicata")
 
     # STEP 2: Ricerca per immobili
     print("[VISURA] Cliccando link Immobile...")
     await page.get_by_role("link", name="Immobile").click()
-    await page.wait_for_load_state("networkidle", timeout=30000)
+    await _wait_for_ready(page, "select[name='denomComune']", label="visura_post_immobile")
     print("[VISURA] Link Immobile cliccato")
     await logger.log(page, "immobile")
 
@@ -644,20 +1114,39 @@ async def run_visura(
     # Trova e seleziona il comune corretto
     print(f"[VISURA] Cercando comune: {comune}")
 
-    # Prima estrai tutti i comuni disponibili per debug
-    comune_options = await page.locator("select[name='denomComune'] option").all()
-    available_comuni = []
-    for option in comune_options:
-        value = await option.get_attribute("value")
-        text = await option.inner_text()
-        if value and text:
-            available_comuni.append(f"{text} ({value})")
+    # Prima estrai tutti i comuni disponibili per debug (single evaluate via helper)
+    _comune_items = await _collect_options_fast(page, "select[name='denomComune']")
+    available_comuni = _format_options_for_debug(_comune_items)
 
     print(
         f"[VISURA] Comuni disponibili: {', '.join(available_comuni[:10])}{'...' if len(available_comuni) > 10 else ''}"
     )
 
-    comune_value = await find_best_option_match(page, "select[name='denomComune']", comune)
+    # Quando il chiamante fornisce il codice belfiore (es. da `parcels.administrativeunit`)
+    # bypassiamo il match-by-name e selezioniamo l'option per prefisso di `value`
+    # (`CODICEBELFIORE#…`), che è più robusto per i comuni con nomi ambigui o
+    # varianti ortografiche divergenti tra ISTAT e SISTER.
+    comune_value = None
+    if codice_belfiore:
+        comune_value = await find_option_by_codice_belfiore(
+            page,
+            "select[name='denomComune']",
+            codice_belfiore,
+            provincia_value=provincia_value,
+        )
+        if not comune_value:
+            print(
+                f"[VISURA] codice_belfiore='{codice_belfiore}' non trovato nelle option, "
+                f"fallback al match per nome '{comune}'"
+            )
+
+    if not comune_value:
+        comune_value = await find_best_option_match(
+            page,
+            "select[name='denomComune']",
+            comune,
+            provincia_value=provincia_value,
+        )
 
     if not comune_value:
         raise Exception(
@@ -675,17 +1164,12 @@ async def run_visura(
     if sezione:
         print("[VISURA] Cliccando 'scegli la sezione' per attivare dropdown...")
         await page.locator("input[name='selSezione'][value='scegli la sezione']").click()
-        await page.wait_for_load_state("networkidle", timeout=30000)
+        await _wait_for_ready(page, "select[name='sezione']", label="visura_sezione_open")
         print("[VISURA] Button sezione cliccato, dropdown attivato")
 
-        # Prima estrai tutte le opzioni disponibili per debug
-        options = await page.locator("select[name='sezione'] option").all()
-        available_sections = []
-        for option in options:
-            value = await option.get_attribute("value")
-            text = await option.inner_text()
-            if value and text:
-                available_sections.append(f"{text} ({value})")
+        # Prima estrai tutte le opzioni disponibili per debug (single evaluate via helper)
+        _sez_items = await _collect_options_fast(page, "select[name='sezione']")
+        available_sections = _format_options_for_debug(_sez_items)
 
         print(f"[VISURA] Sezioni disponibili: {', '.join(available_sections)}")
 
@@ -735,7 +1219,7 @@ async def run_visura(
     # Clicca Ricerca
     print("[VISURA] Cliccando Ricerca...")
     await page.locator("input[name='scelta'][value='Ricerca']").click()
-    await page.wait_for_load_state("networkidle", timeout=30000)
+    await page.wait_for_load_state("domcontentloaded", timeout=30000)
     print("[VISURA] Ricerca cliccata")
     await logger.log(page, "ricerca")
 
@@ -746,7 +1230,7 @@ async def run_visura(
         if await conferma_button.count() > 0:
             print("[VISURA] Rilevata richiesta conferma assenza subalterno...")
             await conferma_button.click()
-            await page.wait_for_load_state("networkidle", timeout=30000)
+            await page.wait_for_load_state("domcontentloaded", timeout=30000)
             print("[VISURA] Conferma assenza subalterno cliccata")
             await logger.log(page, "conferma_subalterno")
     except Exception as e:
@@ -863,7 +1347,7 @@ async def run_visura(
 
         if intestati_button:
             await intestati_button.click()
-            await page.wait_for_load_state("networkidle", timeout=30000)
+            await page.wait_for_load_state("domcontentloaded", timeout=30000)
             print("[VISURA] Intestati cliccato")
             await logger.log(page, "intestati")
 
@@ -1014,18 +1498,16 @@ async def extract_all_sezioni(page: Page, tipo_catasto: str = "T", max_province:
         await page.goto(
             "https://sister3.agenziaentrate.gov.it/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_", timeout=60000
         )
-        await page.wait_for_load_state("networkidle", timeout=30000)
+        await page.wait_for_load_state("domcontentloaded", timeout=30000)
         print("[SEZIONI] Pagina caricata")
         await logger.log(page, "scelta_servizio")
 
         # Estrai tutte le province
         print("[SEZIONI] Estraendo lista province...")
-        provincia_options = await page.locator("select[name='listacom'] option").all()
+        _prov_items_iv = await _collect_options_fast(page, "select[name='listacom']")
         province_list = []
 
-        for option in provincia_options:
-            value = await option.get_attribute("value")
-            text = await option.inner_text()
+        for value, text in _prov_items_iv:
             if value and text and value.strip() and text.strip():
                 # Salta "NAZIONALE" che sembra problematico
                 if "NAZIONALE" not in text.upper():
@@ -1047,13 +1529,13 @@ async def extract_all_sezioni(page: Page, tipo_catasto: str = "T", max_province:
 
                 print("[SEZIONI] Cliccando Applica...")
                 await page.locator("input[type='submit'][value='Applica']").click()
-                await page.wait_for_load_state("networkidle", timeout=30000)
+                await page.wait_for_load_state("domcontentloaded", timeout=30000)
                 print("[SEZIONI] Applica cliccato, pagina caricata")
 
                 # Vai alla ricerca immobili (stesso modo di run_visura)
                 print("[SEZIONI] Cliccando link Immobile...")
                 await page.get_by_role("link", name="Immobile").click()
-                await page.wait_for_load_state("networkidle", timeout=30000)
+                await page.wait_for_load_state("domcontentloaded", timeout=30000)
                 print("[SEZIONI] Link Immobile cliccato")
 
                 # Seleziona tipo catasto (stesso modo di run_visura)
@@ -1066,12 +1548,10 @@ async def extract_all_sezioni(page: Page, tipo_catasto: str = "T", max_province:
 
                 # Estrai tutti i comuni per questa provincia
                 print("[SEZIONI] Estraendo lista comuni...")
-                comune_options = await page.locator("select[name='denomComune'] option").all()
+                _comune_items_iv = await _collect_options_fast(page, "select[name='denomComune']")
                 comuni_list = []
 
-                for option in comune_options:
-                    value = await option.get_attribute("value")
-                    text = await option.inner_text()
+                for value, text in _comune_items_iv:
                     if value and text and value.strip() and text.strip():
                         comuni_list.append({"value": value.strip(), "text": text.strip()})
 
@@ -1091,7 +1571,7 @@ async def extract_all_sezioni(page: Page, tipo_catasto: str = "T", max_province:
                         # Attiva selezione sezione (ESATTO come in run_visura)
                         print("[SEZIONI] Cliccando 'scegli la sezione' per attivare dropdown...")
                         await page.locator("input[name='selSezione'][value='scegli la sezione']").click()
-                        await page.wait_for_load_state("networkidle", timeout=30000)
+                        await page.wait_for_load_state("domcontentloaded", timeout=30000)
                         print("[SEZIONI] Button sezione cliccato, dropdown attivato")
 
                         # Estrai le sezioni per questo comune (stesso modo di run_visura)
@@ -1100,12 +1580,10 @@ async def extract_all_sezioni(page: Page, tipo_catasto: str = "T", max_province:
 
                         try:
                             # Prima verifica se ci sono sezioni disponibili
-                            sezione_options = await page.locator("select[name='sezione'] option").all()
+                            _sez_items_iv = await _collect_options_fast(page, "select[name='sezione']")
                             available_sections = []
 
-                            for option in sezione_options:
-                                value = await option.get_attribute("value")
-                                text = await option.inner_text()
+                            for value, text in _sez_items_iv:
                                 if value and text and value.strip() and text.strip():
                                     available_sections.append({"value": value.strip(), "text": text.strip()})
 
@@ -1175,7 +1653,7 @@ async def extract_all_sezioni(page: Page, tipo_catasto: str = "T", max_province:
                 await page.goto(
                     "https://sister3.agenziaentrate.gov.it/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_", timeout=60000
                 )
-                await page.wait_for_load_state("networkidle", timeout=30000)
+                await page.wait_for_load_state("domcontentloaded", timeout=30000)
                 print("[SEZIONI] Tornato alla pagina principale")
 
             except Exception as e:
@@ -1191,7 +1669,14 @@ async def extract_all_sezioni(page: Page, tipo_catasto: str = "T", max_province:
 
 
 async def run_visura_immobile(
-    page, provincia="Trieste", comune="Trieste", sezione=None, foglio="9", particella="166", subalterno=None
+    page,
+    provincia="Trieste",
+    comune="Trieste",
+    sezione=None,
+    foglio="9",
+    particella="166",
+    subalterno=None,
+    codice_belfiore: Optional[str] = None,
 ):
     """
     Esegue una visura catastale per un immobile specifico (solo per fabbricati con subalterno).
@@ -1219,10 +1704,16 @@ async def run_visura_immobile(
     if not subalterno:
         raise ValueError("Il subalterno è obbligatorio per le visure per immobile specifico")
 
+    # Fail-fast su province non supportate (Trento/Bolzano: Catasto Tavolare).
+    provincia_norm = _normalize_for_match(provincia)
+    unsupported_reason = _UNSUPPORTED_PROVINCES_SISTER.get(provincia_norm)
+    if unsupported_reason:
+        raise Exception(unsupported_reason)
+
     # STEP 1: Selezione Ufficio Provinciale
     print("[VISURA_IMMOBILE] Navigando alla pagina di scelta servizio...")
     await page.goto("https://sister3.agenziaentrate.gov.it/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_", timeout=60000)
-    await page.wait_for_load_state("networkidle", timeout=30000)
+    await _wait_for_ready(page, "select[name='listacom']", label="immobile_scelta_servizio")
     print("[VISURA_IMMOBILE] Pagina caricata")
     await logger.log(page, "scelta_servizio")
 
@@ -1242,13 +1733,17 @@ async def run_visura_immobile(
     await page.locator("select[name='listacom']").select_option(provincia_value)
     print("[VISURA_IMMOBILE] Cliccando Applica...")
     await page.locator("input[type='submit'][value='Applica']").click()
-    await page.wait_for_load_state("networkidle", timeout=30000)
+    await _wait_for_ready(
+        page,
+        "a:has-text('Immobile'), [role='link']:has-text('Immobile')",
+        label="immobile_post_applica",
+    )
     await logger.log(page, "provincia_applicata")
 
     # STEP 2: Ricerca per immobili
     print("[VISURA_IMMOBILE] Cliccando link Immobile...")
     await page.get_by_role("link", name="Immobile").click()
-    await page.wait_for_load_state("networkidle", timeout=30000)
+    await _wait_for_ready(page, "select[name='denomComune']", label="immobile_post_immobile")
     await logger.log(page, "immobile")
 
     # STEP 2.1: Seleziona tipo catasto FABBRICATI (F)
@@ -1257,7 +1752,26 @@ async def run_visura_immobile(
 
     # Trova e seleziona il comune
     print(f"[VISURA_IMMOBILE] Cercando comune: {comune}")
-    comune_value = await find_best_option_match(page, "select[name='denomComune']", comune)
+    comune_value = None
+    if codice_belfiore:
+        comune_value = await find_option_by_codice_belfiore(
+            page,
+            "select[name='denomComune']",
+            codice_belfiore,
+            provincia_value=provincia_value,
+        )
+        if not comune_value:
+            print(
+                f"[VISURA_IMMOBILE] codice_belfiore='{codice_belfiore}' non trovato, "
+                f"fallback al match per nome '{comune}'"
+            )
+    if not comune_value:
+        comune_value = await find_best_option_match(
+            page,
+            "select[name='denomComune']",
+            comune,
+            provincia_value=provincia_value,
+        )
 
     if not comune_value:
         raise Exception(f"Comune '{comune}' non trovato nelle opzioni disponibili")
@@ -1269,16 +1783,11 @@ async def run_visura_immobile(
     if sezione:
         print("[VISURA_IMMOBILE] Cliccando 'scegli la sezione' per attivare dropdown...")
         await page.locator("input[name='selSezione'][value='scegli la sezione']").click()
-        await page.wait_for_load_state("networkidle", timeout=30000)
+        await _wait_for_ready(page, "select[name='sezione']", label="immobile_sezione_open")
 
-        # Controlla se ci sono sezioni disponibili
-        options = await page.locator("select[name='sezione'] option").all()
-        available_sections = []
-        for option in options:
-            value = await option.get_attribute("value")
-            text = await option.inner_text()
-            if value and text:
-                available_sections.append(f"{text} ({value})")
+        # Controlla se ci sono sezioni disponibili (single evaluate via helper)
+        _sez_items_im = await _collect_options_fast(page, "select[name='sezione']")
+        available_sections = _format_options_for_debug(_sez_items_im)
 
         if not available_sections:
             print(f"[VISURA_IMMOBILE] Nessuna sezione disponibile per il comune '{comune}', saltando selezione sezione")
@@ -1313,7 +1822,7 @@ async def run_visura_immobile(
     # Clicca Ricerca
     print("[VISURA_IMMOBILE] Cliccando Ricerca...")
     await page.locator("input[name='scelta'][value='Ricerca']").click()
-    await page.wait_for_load_state("networkidle", timeout=30000)
+    await page.wait_for_load_state("domcontentloaded", timeout=30000)
     await logger.log(page, "ricerca")
 
     # STEP 3: Gestisci conferma assenza subalterno (se necessario)
@@ -1322,7 +1831,7 @@ async def run_visura_immobile(
         if await conferma_button.count() > 0:
             print("[VISURA_IMMOBILE] Rilevata richiesta conferma assenza subalterno...")
             await conferma_button.click()
-            await page.wait_for_load_state("networkidle", timeout=30000)
+            await page.wait_for_load_state("domcontentloaded", timeout=30000)
             await logger.log(page, "conferma_subalterno")
     except Exception as e:
         print(f"[VISURA_IMMOBILE] Errore o non necessaria conferma subalterno: {e}")
@@ -1372,7 +1881,7 @@ async def run_visura_immobile(
 
         if intestati_button:
             await intestati_button.click()
-            await page.wait_for_load_state("networkidle", timeout=30000)
+            await page.wait_for_load_state("domcontentloaded", timeout=30000)
             print("[VISURA_IMMOBILE] Intestati cliccato")
             await logger.log(page, "intestati")
 
