@@ -2,21 +2,27 @@ services:
   visure-service:
     build: .
     ports:
-      - "8000:8000"
+      - "8761:8000"
     environment:
       - PYTHONUNBUFFERED=1
       - DISPLAY=:99
     env_file:
       - .env
     volumes:
-      - ./:/app
-      - ./logs:/app/logs:rw
+      - visura-logs:/app/logs
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
-    # Per debugging, rimuovi in produzione
-    stdin_open: true
-    tty: true
+    networks:
+      - laravel
+
+volumes:
+  visura-logs:
+
+networks:
+  laravel:
+    external: true
+    name: cercavisure-local_sail

@@ -24,8 +24,10 @@ Servizio REST per l'estrazione automatizzata di dati catastali dal portale **SIS
 - [Prerequisiti](#prerequisiti)
 - [Avvio rapido](#avvio-rapido)
 - [Configurazione](#configurazione)
+- [Modalità Sister (credenziali dirette)](#modalità-sister-credenziali-dirette)
 - [Endpoint API](#endpoint-api)
   - [Health check](#health-check)
+  - [Login (solo modalità Sister)](#login-solo-modalità-sister)
   - [Visura immobili (Fase 1)](#visura-immobili-fase-1)
   - [Visura intestati (Fase 2)](#visura-intestati-fase-2)
   - [Polling risultati](#polling-risultati)
@@ -112,6 +114,8 @@ Client HTTP
 |------|-------------|
 | `main.py` | Applicazione FastAPI: endpoint, modelli Pydantic, `BrowserManager`, `VisuraService`, lifespan |
 | `utils.py` | Automazione browser: `login()`, `logout()`, `run_visura()`, `run_visura_immobile()`, `extract_all_sezioni()`, `PageLogger`, `parse_table()` |
+| `sister-login/run.py` | Entry point alternativo per la modalità Sister: patching del login, aggiunta endpoint `POST /login`, generazione PDF documento ufficiale |
+| `sister-login/sister_auth.py` | Implementazione del login Sister con credenziali dirette (senza SPID) |
 | `Dockerfile` | Immagine basata su `python:3.11-slim` con dipendenze per Chromium |
 | `docker-compose.yaml` | Orchestrazione con healthcheck, volumi per log, restart automatico |
 | `requirements.txt` | Dipendenze Python |
@@ -191,9 +195,86 @@ LOG_LEVEL=INFO                    # DEBUG | INFO | WARNING | ERROR
 
 | Variabile | Obbligatoria | Default | Descrizione |
 |-----------|:------------:|---------|-------------|
-| `ADE_USERNAME` | ✅ | — | Codice fiscale per il login SPID |
-| `ADE_PASSWORD` | ✅ | — | Password SPID (Sielte ID) |
+| `ADE_USERNAME` | ✅ | — | Codice fiscale per il login SPID. In modalità Sister (`AUTH_TYPE=sister`): username Sister |
+| `ADE_PASSWORD` | ✅ | — | Password SPID (Sielte ID). In modalità Sister (`AUTH_TYPE=sister`): password Sister |
+| `AUTH_TYPE` | | `spid` | `spid` = login SPID automatico all'avvio; `sister` = login tramite `POST /login` (credenziali dirette Sister) |
 | `LOG_LEVEL` | | `INFO` | Livello di log su console e file |
+
+---
+
+## Modalità Sister (credenziali dirette)
+
+Avviando il servizio tramite `sister-login/run.py` con `AUTH_TYPE=sister`, il flusso di autenticazione cambia rispetto alla modalità SPID predefinita.
+
+### Differenze principali
+
+| Aspetto | Modalità SPID (default) | Modalità Sister |
+|---------|------------------------|-----------------|
+| Entry point | `uvicorn main:app` | `python sister-login/run.py` |
+| Login all'avvio | Automatico (SPID + push MySielteID) | **No** — il browser si avvia senza autenticarsi |
+| Chi chiama il login | Il servizio stesso | Il client esterno via `POST /login` |
+| Credenziali | SPID (codice fiscale + password + push) | Username e password Sister passati nel body |
+| Session refresh | Naviga `SceltaServizio.do` ogni 5 min | Solo mouse movement (non interferisce con visure in corso) |
+| PDF documento | Non generato | Generato automaticamente dopo la visura dati |
+
+### Flusso di una richiesta in modalità Sister
+
+```
+Client (es. Laravel)                  visura-api
+       │                                   │
+       │── POST /login ──────────────────► │  Autentica il browser su Sister
+       │◄─ { authenticated: true } ─────── │  (o "già autenticato" se sessione attiva)
+       │                                   │
+       │── POST /visura ─────────────────► │  Accoda la richiesta → risponde subito con request_id
+       │◄─ { request_ids: [...] } ───────── │
+       │                                   │
+       │                           [worker] esegue visura su Sister
+       │                           [worker] genera PDF documento ufficiale
+       │                           [worker] salva risultato in response_store
+       │                                   │
+       │── GET /visura/{id} ─────────────► │  polling…
+       │◄─ { status: "processing" } ─────── │
+       │                                   │
+       │── GET /visura/{id} ─────────────► │
+       │◄─ { status: "completed",           │
+       │     data: { pdf_base64: "..." } } ─│
+```
+
+### Comportamento del `POST /login`
+
+- Se il browser **non è autenticato** (`authenticated=false`): esegue il login Sister completo e avvia il keep-alive.
+- Se il browser **è già autenticato** (`authenticated=true`): risponde immediatamente con `"già autenticato"` senza riaprire la sessione — evita race condition con visure in corso nel worker.
+
+### Gestione della sessione scaduta
+
+Quando una visura fallisce (qualunque errore, inclusa la sessione Sister scaduta), il flag `authenticated` viene automaticamente resettato a `false`. La chiamata successiva a `POST /login` eseguirà una ri-autenticazione reale invece di rispondere "già autenticato", garantendo una sessione fresca per la visura successiva.
+
+```
+Visura fallita (es. sessione scaduta)
+        │
+        ▼
+authenticated = false          ← reset automatico
+        │
+        ▼
+Prossimo POST /login           ← ri-autentica davvero su Sister
+        │
+        ▼
+Prossima visura funziona
+```
+
+### Avvio in modalità Sister
+
+```bash
+AUTH_TYPE=sister python sister-login/run.py
+```
+
+Oppure con Docker, imposta nel `docker-compose.yaml`:
+
+```yaml
+environment:
+  AUTH_TYPE: sister
+command: ["python", "sister-login/run.py"]
+```
 
 ---
 
@@ -212,6 +293,46 @@ GET /health
   "queue_size": 0
 }
 ```
+
+---
+
+### Login (solo modalità Sister)
+
+```
+POST /login
+```
+
+> Disponibile solo quando il servizio è avviato con `sister-login/run.py` e `AUTH_TYPE=sister`.
+
+Autentica il browser al portale Sister usando le credenziali passate nel body. Deve essere chiamato dal client **prima di ogni `POST /visura`**, per garantire una sessione valida.
+
+**Request body:**
+
+| Campo | Tipo | Obbligatorio | Descrizione |
+|-------|------|:------------:|-------------|
+| `username` | `string` | ✅ | Username Sister |
+| `password` | `string` | ✅ | Password Sister |
+
+**Risposta — primo login o ri-autenticazione:**
+
+```json
+{
+  "status": "ok",
+  "authenticated": true
+}
+```
+
+**Risposta — sessione già attiva (nessuna azione eseguita):**
+
+```json
+{
+  "status": "ok",
+  "authenticated": true,
+  "message": "già autenticato"
+}
+```
+
+> Se una visura precedente è fallita, il flag interno viene resettato a `false` e la chiamata successiva a `POST /login` eseguirà una ri-autenticazione reale, anche se la sessione era nominalmente attiva.
 
 ---
 
@@ -725,6 +846,9 @@ Leggi [CONTRIBUTING.md](CONTRIBUTING.md) per il dettaglio completo. In breve:
 | Risposte lente | Coda piena | Controlla `queue_size` con `GET /health` |
 | Chromium non si avvia in Docker | Dipendenze di sistema mancanti | Usa il Dockerfile fornito che include tutte le librerie necessarie |
 | Log HTML vuoti o mancanti | Errore durante il salvataggio | Controlla i permessi sulla directory `logs/pages/` |
+| `POST /login` risponde sempre "già autenticato" ma la visura fallisce per sessione scaduta | Flag `authenticated` non resettato dopo errore | Aggiornare `sister-login/run.py` alla versione corrente: il fix resetta `authenticated=false` dopo ogni visura fallita |
+| `POST /login` non trovato (404) | Avvio con `main.py` invece di `sister-login/run.py` | In modalità Sister usare `python sister-login/run.py` come entry point |
+| Visura completata ma senza `pdf_base64` | Dati inesistenti su Sister (nessun risultato) oppure bottone "Visura Per Immobile" non trovato | Verificare i dati catastali; i log del container mostrano il flusso esatto |
 
 Per debug approfondito, ispeziona i file HTML in `logs/pages/` — mostrano esattamente cosa vedeva il browser in ogni step.
 

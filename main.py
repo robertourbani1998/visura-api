@@ -135,9 +135,9 @@ class BrowserManager:
                     "--disable-setuid-sandbox",
                     "--disable-dev-shm-usage",
                     "--disable-gpu",
+                    "--disable-gpu-sandbox",
                     "--no-first-run",
                     "--no-zygote",
-                    "--single-process",
                     "--disable-extensions",
                 ],
             )

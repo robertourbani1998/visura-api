@@ -1,6 +1,5 @@
 FROM python:3.11-slim
 
-# Installa dipendenze di sistema per Playwright
 RUN apt-get update && apt-get install -y \
     wget \
     gnupg \
@@ -22,37 +21,29 @@ RUN apt-get update && apt-get install -y \
     libpango-1.0-0 \
     libcairo2 \
     libasound2 \
+    tesseract-ocr \
+    libgl1 \
+    libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-# Crea directory di lavoro
 WORKDIR /app
 
-# Copia e installa dipendenze Python
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt pytesseract pillow
 
-# Copia il codice dell'applicazione
-COPY . .
+COPY main.py utils.py ./
+COPY sister-login/sister_auth.py sister-login/run.py ./
 
-# Installa browser Playwright come root
-RUN playwright install chromium
-
-# Crea un utente non-root per sicurezza e configura directory
 RUN useradd -m -u 1000 appuser && \
     mkdir -p /app/logs && \
     chown -R appuser:appuser /app
 
 USER appuser
-
-# Installa browser Playwright come appuser
 RUN playwright install chromium
 
-# Espone la porta
 EXPOSE 8000
 
-# Variabili d'ambiente
 ENV PYTHONUNBUFFERED=1
 ENV PLAYWRIGHT_BROWSERS_PATH=/home/appuser/.cache/ms-playwright
 
-# Comando di avvio
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+CMD ["python", "run.py"]
