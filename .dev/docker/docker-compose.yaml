@@ -1,13 +1,15 @@
 services:
   visure-service:
-    build: .
+    build:
+      context: ../..
+      dockerfile: .dev/docker/Dockerfile
     ports:
       - "8761:8000"
     environment:
       - PYTHONUNBUFFERED=1
       - DISPLAY=:99
     env_file:
-      - .env
+      - ../../.env
     volumes:
       - visura-logs:/app/logs
     restart: unless-stopped
