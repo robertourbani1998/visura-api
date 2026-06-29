@@ -9,7 +9,7 @@ Servizio REST per l'estrazione automatizzata di dati catastali dal portale **SIS
 > **Disclaimer legale** — Questo progetto è uno strumento indipendente e **non** è affiliato, approvato o supportato dall'Agenzia delle Entrate. L'utente è l'unico responsabile del rispetto dei termini di servizio del portale SISTER e della normativa vigente. L'uso di automazione sul portale potrebbe violare i termini d'uso del servizio.
 
 > [!WARNING]  
-> Per poter attivare le API bisogna **prima** registrarsi e chiedere l'accesso ai servizi sister utilizzando l'Area Personale di Agenzia delle Entrate e poi cercando "sister" tra i servizi disponibili. L'operazione è veloce.
+> Per poter attivare le API bisogna **prima** registrarsi e chiedere l'accesso ai servizi sister utilizzando l'Area Personale di Agenzia delle Entrate e poi cercando "sister" tra i servizi disponibili. L'operazione è veloce: https://www.agenziaentrate.gov.it/portale/adesione-ai-servizi-sister
 
 **iscriviti alla newsletter**:
 
@@ -35,6 +35,7 @@ Servizio REST per l'estrazione automatizzata di dati catastali dal portale **SIS
   - [Shutdown](#shutdown)
 - [Esempi d'uso](#esempi-duso)
 - [Logging e debug](#logging-e-debug)
+- [Protezione dati e retention](#protezione-dati-e-retention)
 - [Dettagli tecnici](#dettagli-tecnici)
 - [Sviluppo e contribuzione](#sviluppo-e-contribuzione)
 - [Risoluzione dei problemi](#risoluzione-dei-problemi)
@@ -56,7 +57,7 @@ Entrambe le richieste vengono accodate ed eseguite sequenzialmente su un singolo
 
 ### Funzionalità principali
 
-- **Autenticazione SPID automatizzata** via provider Sielte ID (CIE Sign) con push notification
+- **Autenticazione SPID/SISTER automatizzata** — provider Sielte ID, PosteID o login diretto SISTER (selezionabile via `SPID_PROVIDER`)
 - **Coda sequenziale** — le richieste vengono processate una alla volta per non sovraccaricare il portale
 - **Ri-autenticazione automatica** — alla scadenza della sessione, il servizio tenta prima un recovery diretto e, solo se necessario, un nuovo login SPID
 - **Keep-alive** — la sessione viene mantenuta attiva con un light keep-alive ogni 30 secondi e un refresh profondo ogni 5 minuti
@@ -64,9 +65,23 @@ Entrambe le richieste vengono accodate ed eseguite sequenzialmente su un singolo
 - **Logging HTML completo** — ogni pagina visitata dal browser viene salvata su disco per debug e audit
 - **Docker-ready** — immagine pronta con tutte le dipendenze di sistema per Chromium headless
 
-### Compatibilità SPID
+### Provider di autenticazione supportati
 
-Il login automatizzato funziona **esclusivamente** con il provider **Sielte ID (CIE Sign)**. Il flusso prevede l'approvazione via push notification sull'app MySielteID. Altri provider SPID non sono supportati e richiederebbero modifiche alla funzione `login()` in `utils.py`.
+Il provider è selezionato dalla variabile d'ambiente `SPID_PROVIDER` (case-insensitive, default `sielte`):
+
+| `SPID_PROVIDER` | Provider | Credenziali richieste | 2° fattore |
+|-----------------|----------|------------------------|------------|
+| `sielte` (default) | SPID Sielte ID | `ADE_USERNAME`, `ADE_PASSWORD` | push notification su app MySielteID |
+| `poste` | SPID PosteID | `POSTE_USERNAME`, `POSTE_PASSWORD` | approvazione su app PosteID |
+| `sister` | Login diretto SISTER (tab dedicato sulla pagina ADE) | `SISTER_USERNAME`, `SISTER_PASSWORD` | nessuno (credenziali nominali professionali) |
+
+#### Scope d'uso ammesso per il provider `sister`
+
+> Il login diretto SISTER è destinato esclusivamente all'**intestatario della convenzione SISTER** che desidera automatizzare le proprie consultazioni con le proprie credenziali nominali.
+>
+> **Non è destinato** a chi vuole rivendere o esporre l'accesso al portale SISTER a terzi: la convenzione SISTER (Agenzia delle Entrate) richiede che l'utenza sia personale, non cedibile, e che le consultazioni siano riconducibili all'intestatario.
+>
+> Questo progetto è una libreria di automazione: la responsabilità dell'uso delle credenziali e del rispetto dei termini di convenzione resta dell'intestatario, esattamente come per il flusso SPID.
 
 ### Limitazioni note
 
@@ -692,6 +707,22 @@ Ogni file HTML include in testa dei commenti con metadati:
 
 ---
 
+## Protezione dati e retention
+
+I dati estratti da SISTER e i log HTML generati da `PageLogger` possono contenere dati personali e informazioni patrimoniali. Chi esegue il servizio è responsabile della configurazione, conservazione, protezione e cancellazione di questi dati nel proprio ambiente.
+
+Raccomandazioni operative:
+
+- Imposta `LOG_PAGES=0` in produzione, salvo sessioni di debug mirate.
+- Conserva `logs/visura.log` e `logs/pages/` solo per il tempo necessario a diagnosi, audit tecnico o obblighi interni documentati.
+- Cancella o anonimizza i file HTML prima di condividerli in issue, PR, chat o ticket di supporto.
+- Proteggi l'accesso a `logs/`, backup e volumi Docker con gli stessi controlli usati per dati personali.
+- Definisci una procedura di retention esplicita per risultati in memoria, file di log e copie di backup.
+
+Il progetto non applica ancora un mascheramento automatico dei dati nei log HTML: verifica sempre manualmente i file prima di esportarli fuori dal tuo ambiente.
+
+---
+
 ## Dettagli tecnici
 
 ### Gestione della sessione
@@ -858,12 +889,60 @@ Per debug approfondito, ispeziona i file HTML in `logs/pages/` — mostrano esat
 
 Sviluppato da [zornade](https://zornade.com).
 
+Copyright © 2026 [zornade](https://zornade.com).
+
 ---
 
 ## Licenza
 
-Distribuito sotto licenza [GNU Affero General Public License v3.0](LICENSE).
+Distribuito sotto licenza **[GNU Affero General Public License v3.0 — only](LICENSE)** (`SPDX-License-Identifier: AGPL-3.0-only`).
+
+Vedi anche il file [`NOTICE`](NOTICE) per il testo completo dell'avviso di copyright e per le obbligazioni AGPL §13 imposte agli operatori di servizi di rete.
+
+### Cronologia della licenza
+
+| Data       | Commit    | Licenza                  |
+|------------|-----------|--------------------------|
+| 2026-03-04 | `128082c` | GPL-3.0-only (release iniziale) |
+| 2026-03-12 | `c8126e8` | **AGPL-3.0-only** (licenza attuale) |
+
+> Chi ha forkato il repository **prima** del commit `c8126e8` conserva un grant perpetuo GPL-3.0 su quella snapshot. Chi ha forkato o tirato modifiche **dopo** `c8126e8` è vincolato ad AGPL-3.0-only.
+
+### ⚠️ Stai forkando? Leggi prima questa sezione
+
+AGPL-3.0 è una **strong copyleft network license**. In particolare la clausola §13 ("Remote Network Interaction") impone obblighi che molti sviluppatori sottovalutano. Se intendi forkare `visura-api` e usarlo in un servizio di rete, sei tenuto a:
+
+1. **Mantenere AGPL-3.0** in tutte le distribuzioni del fork. Non puoi rilicenziare ad Apache, MIT, BSD, GPL-2, GPL-3 o altre licenze.
+2. **Preservare** il file `LICENSE`, il file `NOTICE`, gli header SPDX e i credit all'autore originale in ogni copia distribuita o ridistribuita.
+3. **Pubblicare le tue modifiche** al codice base sotto AGPL-3.0, includendo l'intera storia git delle modifiche.
+4. **Se esponi il fork (o un suo derivato) come servizio di rete** — SaaS, B2B API, dashboard, microservizio, intranet — devi offrire a tutti gli utenti del servizio l'accesso pubblico al *Corresponding Source* completo dell'opera combinata, comprese:
+   - le tue modifiche al codice base,
+   - **tutte le componenti private linkate o combinate** col servizio (autenticazione, SPID/CIE adapter, frontend, theme, orchestratori, workflow engines, moduli di scoring, integrazioni Stripe/Clerk/CRM, schema DB e migrations Alembic, Dockerfile, Helm chart, IaC),
+   - le installation information necessarie a ricostruire un deploy comparabile.
+5. **Pubblicare un avviso visibile** ("prominent offer") nell'UI o nella documentazione API del servizio, con il link al Corresponding Source.
+
+La mancata conformità ad AGPL §13 termina automaticamente i tuoi diritti sul software (AGPL §8) ed espone a rivendicazioni legali.
+
+### Checklist forker (rapida)
+
+- [ ] Il `LICENSE` del mio fork è ancora `AGPL-3.0-only`?
+- [ ] Il file `NOTICE` è presente e include il copyright originale?
+- [ ] Gli header SPDX nei file sorgente sono preservati?
+- [ ] Il `README` del mio fork attribuisce esplicitamente il progetto upstream?
+- [ ] Tutte le dipendenze private che linkero/combinerò sono pronte a essere pubblicate come Corresponding Source, in caso di deploy in rete?
+- [ ] Ho preparato la "prominent offer" del Corresponding Source nell'UI/docs del mio servizio?
+- [ ] Se non posso/non voglio rispettare uno dei punti sopra, ho contattato `hello@zornade.com` per una licenza commerciale?
+
+### Licenza commerciale (dual licensing)
+
+Se la licenza AGPL-3.0 non si adatta al tuo caso d'uso (es. SaaS proprietario, prodotto closed-source, integrazione in piattaforma enterprise senza obbligo di pubblicare i moduli combinati), è disponibile una **licenza commerciale separata** acquistabile da zornade. Vedi [`COMMERCIAL-LICENSE.md`](COMMERCIAL-LICENSE.md) per condizioni e pricing indicativo.
+
+Contatto: `hello@zornade.com` · [zornade.com/licensing](https://zornade.com/licensing)
+
+### Enforcement
+
+In caso di violazioni AGPL, contattare `hello@zornade.com` con oggetto `[AGPL] <nome del fork o servizio>`. Il maintainer applica le pratiche di enforcement raccomandate da [Software Freedom Conservancy](https://sfconservancy.org/copyleft-compliance/) e [FSF](https://www.fsf.org/licensing/): contatto privato prima di azioni pubbliche, finestra di rimedio di 30 giorni, escalation solo se necessaria.
 
 ---
 
-*Ultimo aggiornamento: marzo 2026*
+*Ultimo aggiornamento: maggio 2026*

@@ -29,21 +29,23 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt pytesseract pillow
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY main.py utils.py ./
 COPY sister-login/sister_auth.py sister-login/run.py ./
 
+# Crea un utente non-root per sicurezza e configura directory
 RUN useradd -m -u 1000 appuser && \
     mkdir -p /app/logs && \
     chown -R appuser:appuser /app
+
+# Variabili d'ambiente per Playwright
+ENV PLAYWRIGHT_BROWSERS_PATH=/home/appuser/.cache/ms-playwright
+ENV PYTHONUNBUFFERED=1
 
 USER appuser
 RUN playwright install chromium
 
 EXPOSE 8000
-
-ENV PYTHONUNBUFFERED=1
-ENV PLAYWRIGHT_BROWSERS_PATH=/home/appuser/.cache/ms-playwright
 
 CMD ["python", "run.py"]

@@ -18,6 +18,33 @@ Se non ricevi risposta entro questi tempi, sentiti libero di fare un ping gentil
 
 Partecipando a questo progetto accetti di rispettare il nostro [Codice di Condotta](CODE_OF_CONDUCT.md).
 
+## Licenza dei contributi (DCO + grant di relicensing)
+
+`visura-api` è distribuito sotto **AGPL-3.0-only** ed è disponibile anche sotto **licenza commerciale separata** per chi non può/non vuole rispettare AGPL §13 (vedi [`COMMERCIAL-LICENSE.md`](COMMERCIAL-LICENSE.md)). Per poter mantenere viable questo modello dual-license — che finanzia lo sviluppo del progetto — ogni contribuzione deve rispettare due condizioni:
+
+### 1. Developer Certificate of Origin (DCO)
+
+Firma ogni commit con `git commit --signoff` (oppure `-s`). Questo aggiunge in fondo al messaggio una riga del tipo:
+
+```
+Signed-off-by: Nome Cognome <email@example.com>
+```
+
+Firmando, certifichi che il contributo è tuo e che hai il diritto di sottometterlo sotto la licenza del progetto. Vedi il testo completo del DCO 1.1 su https://developercertificate.org.
+
+### 2. Grant di relicensing al maintainer
+
+Aprendo una pull request e firmando i commit, **concedi a zornade** (titolare del copyright upstream) un **grant non-esclusivo, mondiale, perpetuo e irrevocabile** di:
+
+- distribuire la tua contribuzione sotto AGPL-3.0-only,
+- e di **rilicenziarla sotto licenze commerciali separate** (incluse condizioni proprietarie) a clienti paganti, **senza alcun obbligo di compenso aggiuntivo nei tuoi confronti**.
+
+Mantieni il copyright sulla tua contribuzione e puoi riusarla in qualsiasi tuo progetto, ma non puoi revocare il grant di relicensing concesso a zornade per le contribuzioni gia accettate nel progetto.
+
+Se questo modello non ti sta bene, **non aprire la PR**: contattaci prima a `hello@zornade.com` per discutere alternative (es. contribuzione tramite repository di plugin esterni).
+
+> **Perché serve questo grant?** Senza il grant di relicensing, ogni contributor diventerebbe co-titolare del copyright del codice fuso, e nessuno potrebbe rilicenziare l'intera codebase senza il consenso esplicito di tutti. Questo bloccherebbe la dual-licensing, che è il meccanismo principale con cui il progetto si finanzia. Lo stesso modello è adottato da MongoDB, Elastic, Sentry, Plausible Analytics e Grafana.
+
 ## Policy sull'uso di strumenti AI
 
 L'uso di strumenti AI (GitHub Copilot, ChatGPT, Claude, ecc.) come **supporto** è benvenuto, ma con regole chiare:
