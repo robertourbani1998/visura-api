@@ -5,8 +5,26 @@ from playwright.async_api import Page
 
 from utils import PageLogger
 
-_CLOSE_SESSIONS_URL = "https://sister3.agenziaentrate.gov.it/Servizi/CloseSessions"
+_CLOSE_SESSIONS_URL = "https://sister3.agenziaentrate.gov.it/Servizi/CloseSessionsSis"
 _LOGIN_URL = "https://iampe.agenziaentrate.gov.it/sam/UI/Login?realm=/agenziaentrate"
+
+
+async def _chiudi_tutte_sessioni(page: Page, max_tentativi: int = 15) -> None:
+    """Naviga ripetutamente a CloseSessionsSis finché Sister non ha sessioni attive."""
+    for i in range(max_tentativi):
+        try:
+            await page.goto(_CLOSE_SESSIONS_URL, timeout=20000)
+            await page.wait_for_load_state("domcontentloaded", timeout=10000)
+            content = await page.content()
+            if "Utente gia' in sessione" not in content:
+                print(f"[LOGIN-SISTER] Sessioni pulite dopo {i+1} chiusura/e.")
+                return
+            print(f"[LOGIN-SISTER] Sessione ancora attiva, chiudo ancora (tentativo {i+1}/{max_tentativi})...")
+            await asyncio.sleep(3)
+        except Exception as e:
+            print(f"[LOGIN-SISTER] Errore chiusura sessione {i+1}: {e}")
+            await asyncio.sleep(3)
+    print(f"[LOGIN-SISTER] Sessioni non pulite dopo {max_tentativi} tentativi.")
 
 
 async def login(page: Page):
@@ -14,7 +32,7 @@ async def login(page: Page):
 
     Sostituisce solo il flusso di autenticazione (tab Sister invece di SPID).
     La navigazione post-login dentro Sister è identica all'originale utils.login().
-    Chiude eventuali sessioni attive prima di procedere e riprova fino a 2 volte.
+    Chiude eventuali sessioni attive prima di procedere e riprova fino a 5 volte.
     """
     username = os.getenv("ADE_USERNAME")
     password = os.getenv("ADE_PASSWORD")
@@ -23,47 +41,25 @@ async def login(page: Page):
         raise ValueError("ADE_USERNAME e ADE_PASSWORD devono essere impostati nel .env")
 
     # Chiudi proattivamente qualsiasi sessione residua prima di tentare il login.
-    # Necessario dopo crash o riavvii in cui la sessione Sister non è stata chiusa.
     print("[LOGIN-SISTER] Chiudo eventuali sessioni residue...")
-    try:
-        await page.goto(_CLOSE_SESSIONS_URL, timeout=15000)
-        await page.wait_for_load_state("domcontentloaded", timeout=10000)
-        await asyncio.sleep(3)
-    except Exception:
-        pass  # Nessuna sessione attiva o errore ignorabile
+    await _chiudi_tutte_sessioni(page)
+    await page.context.clear_cookies()
+    await asyncio.sleep(3)
 
     for tentativo in range(5):
         try:
             await _esegui_login(page, username, password)
             return
         except _SessoneBloccataError:
-            if tentativo < 4:
-                print(f"[LOGIN-SISTER] Sessione attiva (tentativo {tentativo+1}) — chiudo sessioni residue...")
-                # Chiudi in loop: ogni login fallito lascia una sessione aperta.
-                # Continuiamo a cliccare CloseSessions finché la pagina non cambia.
-                for _ in range(3):
-                    try:
-                        await page.click('a[href*="CloseSessions"]', timeout=8000)
-                    except Exception:
-                        await page.goto(_CLOSE_SESSIONS_URL, timeout=15000)
-                    try:
-                        await page.wait_for_load_state("networkidle", timeout=15000)
-                    except Exception:
-                        await page.wait_for_load_state("domcontentloaded", timeout=10000)
-                    try:
-                        content = await page.content()
-                        if "Utente gia' in sessione" not in content:
-                            break
-                    except Exception:
-                        pass
-                    await asyncio.sleep(5)
-                print("[LOGIN-SISTER] Sessioni chiuse. Attendo 45s prima di riprovare...")
-                await asyncio.sleep(45)  # Sister necessita tempo per invalidare lato server
-                # Cancella i cookie SSO: senza questo iampe auto-autentica bypassando il form
-                # e crea una nuova sessione Sister che si blocca immediatamente.
-                await page.context.clear_cookies()
-            else:
-                raise Exception("Utente già in sessione su un'altra postazione (dopo chiusura)")
+            print(f"[LOGIN-SISTER] Sessione bloccata (tentativo {tentativo+1}/5) — chiudo tutte le sessioni...")
+            await _chiudi_tutte_sessioni(page)
+            print("[LOGIN-SISTER] Attendo 30s prima di riprovare...")
+            await asyncio.sleep(30)
+            # Cancella i cookie SSO: senza questo iampe auto-autentica bypassando il form
+            # e crea una nuova sessione Sister che si blocca immediatamente.
+            await page.context.clear_cookies()
+
+    raise Exception("Utente già in sessione su un'altra postazione (dopo chiusura)")
 
 
 class _SessoneBloccataError(Exception):
