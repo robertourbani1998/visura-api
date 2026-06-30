@@ -355,12 +355,51 @@ print("[RUN] Patch esegui_visura per generazione PDF documento ufficiale.")
 # lista HTML (caso nazionale senza bottone PDF), proviamo a trovare il bottone
 # "Visura per Soggetto" sulla pagina risultati.
 
-async def _risolvi_captcha_e_inoltra_soggetto(page, max_tentativi: int = 20) -> bool:
+def _captcha_e_leggibile(img_bytes: bytes) -> tuple:
+    """Ritorna (leggibile: bool, testo: str).
+
+    Rileva stili "impossibili" (cross-hatch su bianco, cursivo con OCR garbage)
+    e scarta senza submit. Le captcha soggetto di Sister variano molto: alcune
+    hanno lo stesso stile semplice dell'immobile (rosso su giallo), altre hanno
+    cross-hatch su bianco o corsivo su sfondo uniforme che nessun OCR può leggere.
+    Rilevando e scartando le hard captcha si cicla più veloce verso quelle facili.
+    """
+    from PIL import Image
+    import numpy as np, io as _io
+
+    arr = np.array(Image.open(_io.BytesIO(img_bytes)).convert('RGB'))
+    brightness = float(arr.mean())
+    bright_90 = float(np.percentile(arr, 90))
+
+    # Sfondo bianco (>245 al 90° percentile) = cross-hatch su bianco → impossibile per OCR
+    if bright_90 > 245 and brightness > 170:
+        print(f"[PDF_SOG] Captcha sfondo bianco (cross-hatch) rilevata, scarto. bright={brightness:.0f} p90={bright_90:.0f}")
+        return False, ''
+
+    testo = _leggi_captcha(img_bytes)
+
+    # Controlla che il risultato sembri una parola (almeno 2 vocali su 5+ char)
+    VOWELS = set('aeiou')
+    n_vowels = sum(1 for c in testo if c in VOWELS)
+    if len(testo) >= 5 and n_vowels < 2:
+        print(f"[PDF_SOG] OCR garbage ('{testo}', vocali={n_vowels}), scarto senza submit.")
+        return False, ''
+
+    return True, testo
+
+
+async def _risolvi_captcha_e_inoltra_soggetto(page, max_tentativi: int = 30) -> bool:
     """Come _risolvi_captcha_e_inoltra ma per il form visura soggetto.
 
     Il form soggetto non ha il radio ``intestati``: setta solo ``tipoDocFornitura=PDF``
     se presente, poi clicca ``inoltra``.
+
+    Le captcha soggetto variano molto per difficoltà. Si scartano quelle
+    "impossibili" (cross-hatch su bianco, OCR garbage) per ciclare più in fretta
+    verso quelle facili (stesso stile dell'immobile: rosso su giallo).
     """
+    reload_el = page.locator('a[onclick*="reloadImg"]')
+
     for tentativo in range(max_tentativi):
         captcha_el = page.locator('#imgCaptcha')
         ha_captcha = await captcha_el.count() > 0
@@ -370,7 +409,7 @@ async def _risolvi_captcha_e_inoltra_soggetto(page, max_tentativi: int = 20) -> 
                 "document.querySelector('#imgCaptcha') && document.querySelector('#imgCaptcha').complete && document.querySelector('#imgCaptcha').naturalWidth > 0",
                 timeout=10000,
             )
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.2)
             img_bytes = await captcha_el.screenshot()
 
             import os as _os
@@ -379,12 +418,16 @@ async def _risolvi_captcha_e_inoltra_soggetto(page, max_tentativi: int = 20) -> 
             with open(f"{debug_dir}/captcha_soggetto_{tentativo+1}_raw.png", "wb") as f:
                 f.write(img_bytes)
 
-            testo = _leggi_captcha(img_bytes)
-            if len(testo) < 4:
-                print(f"[PDF_SOG] OCR insufficiente ('{testo}'), ricarico captcha...")
-                await page.locator('a[onclick*="reloadImg"]').click()
-                await asyncio.sleep(1.5)
+            leggibile, testo = _captcha_e_leggibile(img_bytes)
+
+            if not leggibile or len(testo) < 4:
+                # Hard captcha o OCR insufficiente: ricarica subito senza submit
+                if await reload_el.count() > 0:
+                    await reload_el.first.click()
+                    await asyncio.sleep(0.5)
                 continue
+
+            print(f"[PDF_SOG] OCR tentativo {tentativo+1}: '{testo}'")
             await page.locator('#inCaptchaChars').fill(testo)
 
         # tipoDocFornitura=PDF se presente (opzionale per soggetto)
