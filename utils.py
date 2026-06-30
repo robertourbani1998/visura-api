@@ -1446,6 +1446,7 @@ async def run_visura_soggetto(
     provincia_amm: Optional[str] = None,
     sede: Optional[str] = None,
     tipo_ispezione: Optional[str] = None,
+    omonimo_valore: Optional[str] = None,
 ):
     """Esegue una visura catastale per soggetto (persona fisica o giuridica).
 
@@ -1668,6 +1669,54 @@ async def run_visura_soggetto(
         time1 = time.time()
         print(f"[VISURA_SOGGETTO] Nessuna corrispondenza trovata in {time1-time0:.2f}s")
         return {"immobili": [], "total_results": 0, "error": "NESSUNA CORRISPONDENZA TROVATA"}
+
+    # STEP 7b: Selezione omonimi — Sister mostra la lista persone trovate prima di navigare
+    # agli immobili. Se omonimo_valore non è fornito, restituiamo la lista all'utente;
+    # se è fornito, selezioniamo il radio corrispondente e procediamo.
+    omonimi_form = page.locator("form[name='SceltaOmonimiForm']")
+    if await omonimi_form.count() > 0:
+        await logger.log(page, "omonimi")
+        radios = page.locator("form[name='SceltaOmonimiForm'] input[name='omonimoSelezionato']")
+        radio_count = await radios.count()
+
+        if omonimo_valore is None:
+            # Estrai lista omonimi e restituisci al chiamante per la selezione utente
+            omonimi = []
+            for i in range(radio_count):
+                valore = await radios.nth(i).get_attribute("value") or ""
+                parts = valore.split("#")
+                omonimi.append({
+                    "valore":          valore,
+                    "cognome":         parts[2] if len(parts) > 2 else "",
+                    "nome":            parts[3] if len(parts) > 3 else "",
+                    "codice_fiscale":  parts[4] if len(parts) > 4 else "",
+                    "data_nascita":    parts[6] if len(parts) > 6 else "",
+                    "luogo_nascita":   f"{parts[5]} ({parts[7]})" if len(parts) > 7 else (parts[5] if len(parts) > 5 else ""),
+                })
+            print(f"[VISURA_SOGGETTO] Omonimi trovati: {len(omonimi)}, richiesta selezione utente")
+            return {"omonimi_required": True, "omonimi": omonimi, "immobili": [], "total_results": 0}
+
+        # Trova e clicca il radio con il valore specificato
+        radio_clicked = False
+        for i in range(radio_count):
+            valore = await radios.nth(i).get_attribute("value") or ""
+            if valore == omonimo_valore:
+                await radios.nth(i).click()
+                radio_clicked = True
+                print(f"[VISURA_SOGGETTO] Omonimo selezionato: {omonimo_valore}")
+                break
+        if not radio_clicked:
+            raise ValueError(f"Omonimo non trovato con valore: {omonimo_valore}")
+
+        await page.locator("form[name='SceltaOmonimiForm'] input[name='immobili'][value='Immobili']").click()
+        await page.wait_for_load_state("domcontentloaded", timeout=30000)
+        await logger.log(page, "immobili_soggetto")
+        # Ri-controlla assenza risultati dopo navigazione omonimi
+        page_text = await page.inner_text("body")
+        if "NESSUNA CORRISPONDENZA TROVATA" in page_text or "Nessun immobile trovato" in page_text:
+            time1 = time.time()
+            print(f"[VISURA_SOGGETTO] Nessun immobile trovato per il soggetto in {time1-time0:.2f}s")
+            return {"immobili": [], "total_results": 0, "error": "NESSUN IMMOBILE TROVATO PER IL SOGGETTO"}
 
     # STEP 8: Parse tabella risultati
     print("[VISURA_SOGGETTO] Estraendo tabella risultati...")

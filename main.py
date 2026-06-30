@@ -154,6 +154,7 @@ class VisuraSoggettoRequest:
     provincia_amm: Optional[str] = None
     sede: Optional[str] = None
     tipo_ispezione: Optional[str] = None
+    omonimo_valore: Optional[str] = None
     timestamp: datetime = None
 
     def __post_init__(self):
@@ -700,6 +701,7 @@ class BrowserManager:
                 provincia_amm=request.provincia_amm,
                 sede=request.sede,
                 tipo_ispezione=request.tipo_ispezione,
+                omonimo_valore=request.omonimo_valore,
             )
 
             logger.info(f"Visura soggetto completata per {request.request_id}")
@@ -1088,6 +1090,7 @@ class VisuraSoggettoInput(BaseModel):
     provincia_amm: Optional[str] = Field(None, description="Provincia sede, codice 2 lettere (solo PNF)")
     sede: Optional[str] = Field(None, description="Comune sede (solo PNF)")
     tipo_ispezione: Optional[str] = Field(None, pattern=r"^[RA]$", description="'R' = Ristretta, 'A' = Ampliata (solo PNF)")
+    omonimo_valore: Optional[str] = Field(None, description="Valore del radio button omonimoSelezionato (formato: id#idx#CF#NOME#...); None = restituisce lista omonimi")
 
 
 class SezioniExtractionRequest(BaseModel):
@@ -1264,6 +1267,7 @@ async def richiedi_visura_soggetto(
             provincia_amm=request.provincia_amm,
             sede=request.sede,
             tipo_ispezione=request.tipo_ispezione,
+            omonimo_valore=request.omonimo_valore,
         )
         await service.add_soggetto_request(soggetto_req)
 
