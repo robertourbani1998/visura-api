@@ -1575,11 +1575,17 @@ async def run_visura_soggetto(
         except Exception as e:
             print(f"[VISURA_SOGGETTO] Errore selezione comuneCat: {e}")
 
-    # STEP 5: tipo_richiesta — presente su entrambe le form (ufficio e nazionale), 'S' va cliccato ('A' è default)
+    # STEP 5: tipo_richiesta — presente solo nei form con ufficio (non nazionale).
+    # 'A' = Attualità (preselezionata), 'S' = Storica. Va cliccata solo S.
+    # Su form nazionale il campo non esiste: count==0 → nessun click, nessun errore.
     if tipo_richiesta and tipo_richiesta != "A":
         print(f"[VISURA_SOGGETTO] Selezionando tipo_richiesta: {tipo_richiesta}")
         try:
-            await page.locator(f"input[name='tipo_richiesta'][value='{tipo_richiesta}']").click()
+            loc = page.locator(f"input[name='tipo_richiesta'][value='{tipo_richiesta}']")
+            if await loc.count() > 0:
+                await loc.click()
+            else:
+                print(f"[VISURA_SOGGETTO] tipo_richiesta='{tipo_richiesta}' non presente nel form (normale per ricerca nazionale)")
         except Exception as e:
             print(f"[VISURA_SOGGETTO] Errore selezione tipo_richiesta: {e}")
 
