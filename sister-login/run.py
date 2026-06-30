@@ -100,9 +100,10 @@ def _leggi_captcha(img_bytes: bytes) -> str:
     buf = _io.BytesIO(); img3.save(buf, 'PNG')
     results.append(('color+3x', read(buf.getvalue())))
 
-    # Strategie 5-7: separazione canali colore (efficace per captcha colorati)
+    # Strategie 5-9: separazione canali colore (efficace per captcha colorati)
+    # R-G: testo rosso/giallo su sfondo scuro; B-R/B-G: testo blu su qualsiasi sfondo
     w, h = img.width * 3, img.height * 3
-    for name, ch_a, ch_b in [('R-G', 0, 1), ('R-B', 0, 2), ('G-B', 1, 2)]:
+    for name, ch_a, ch_b in [('R-G', 0, 1), ('R-B', 0, 2), ('G-B', 1, 2), ('B-R', 2, 0), ('B-G', 2, 1)]:
         diff = np.clip(arr[:, :, ch_a].astype(int) - arr[:, :, ch_b].astype(int), 0, 255).astype(np.uint8)
         diff_img = ImageOps.autocontrast(Image.fromarray(diff)).resize((w, h), Image.LANCZOS)
         buf = _io.BytesIO(); diff_img.save(buf, 'PNG')
@@ -125,20 +126,22 @@ def _leggi_captcha(img_bytes: bytes) -> str:
     blue_frac = float((br_diff > 80).mean())   # testo blu su sfondo chiaro
     print(f"[OCR] Style detect: red_frac={red_frac:.3f} blue_frac={blue_frac:.3f}")
 
-    # Stile 4 – rosso su verde: R-G è affidabile al 100%
-    if red_frac > 0.1:
-        t = pick('R-G+3x')
-        if t:
-            print(f"[OCR] Stile ROSSO/VERDE → R-G: '{t}'")
-            return t
-
-    # Stile 2/3 – testo blu su sfondo chiaro: usa B-R, poi B-G
+    # Testo blu su qualsiasi sfondo (incluso rosso): B-R isola il testo blu
+    # Priorità PRIMA di rosso: captcha blu-su-rosso ha red_frac alto (bg rosso)
+    # ma deve usare B-R, non R-G.
     if blue_frac > 0.15:
         for key in ('B-R+3x', 'B-G+3x'):
             t = pick(key)
             if t:
                 print(f"[OCR] Stile BLU → {key}: '{t}'")
                 return t
+
+    # Testo rosso/giallo su sfondo scuro/verde: R-G isola il testo
+    if red_frac > 0.1:
+        t = pick('R-G+3x')
+        if t:
+            print(f"[OCR] Stile ROSSO/VERDE → R-G: '{t}'")
+            return t
 
     # Tutti gli altri stili: maggioranza
     validi = [t for _, t in results if 5 <= len(t) <= 10]

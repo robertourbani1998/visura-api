@@ -1423,6 +1423,290 @@ async def run_visura(
     return result
 
 
+async def run_visura_soggetto(
+    page,
+    tipo_soggetto: str = "PF",
+    provincia: Optional[str] = None,
+    comune_cat: Optional[str] = None,
+    tipo_catasto: str = "E",
+    codice_fiscale: str = "",
+    tipo_richiesta: Optional[str] = None,
+    # Campi PF opzionali
+    cognome: Optional[str] = None,
+    nome: Optional[str] = None,
+    gg_nascita: Optional[str] = None,
+    mm_nascita: Optional[str] = None,
+    anno_nascita: Optional[str] = None,
+    sesso: Optional[str] = None,
+    provincia_amm_pf: Optional[str] = None,
+    luogo_nasc: Optional[str] = None,
+    tipo_ispezione_pf: Optional[str] = None,
+    # Campi PNF opzionali
+    denominazione: Optional[str] = None,
+    provincia_amm: Optional[str] = None,
+    sede: Optional[str] = None,
+    tipo_ispezione: Optional[str] = None,
+):
+    """Esegue una visura catastale per soggetto (persona fisica o giuridica).
+
+    Args:
+        page: Pagina Playwright autenticata
+        tipo_soggetto: 'PF' = Persona Fisica, 'PNF' = Persona Giuridica
+        provincia: Nome provincia per selezione ufficio; None = ricerca nazionale
+        comune_cat: Nome comune o '$' per tutta la provincia; None = tutta la provincia
+        tipo_catasto: 'E' = Tutti, 'T' = Terreni, 'F' = Fabbricati
+        codice_fiscale: Codice fiscale del soggetto
+        tipo_richiesta: 'A' = Attuale, 'S' = Storica; None = attuale (default Sister)
+                        Non disponibile per ricerche nazionali (provincia=None)
+    """
+    time0 = time.time()
+    logger = PageLogger("visura_soggetto")
+    lista = "PF" if tipo_soggetto == "PF" else "PNF"
+    nazionale = not provincia
+
+    print(
+        f"[VISURA_SOGGETTO] Inizio: tipo={tipo_soggetto}, provincia={provincia or 'NAZIONALE'}, "
+        f"comune_cat={comune_cat}, tipo_catasto={tipo_catasto}, tipo_richiesta={tipo_richiesta}"
+    )
+
+    if nazionale:
+        # Ricerca nazionale: naviga direttamente a SceltaLink con codUfficio=IT
+        link_nazionale = f"https://sister3.agenziaentrate.gov.it/Visure/SceltaLink.do?lista={lista}&codUfficio=IT"
+        print(f"[VISURA_SOGGETTO] Ricerca nazionale, navigo direttamente a: {link_nazionale}")
+        await page.goto(link_nazionale, timeout=60000)
+        await page.wait_for_load_state("domcontentloaded", timeout=30000)
+        await logger.log(page, "form_nazionale")
+    else:
+        # Ricerca per ufficio: SceltaServizio → Applica → click link soggetto
+        provincia_norm = _normalize_for_match(provincia)
+        unsupported_reason = _UNSUPPORTED_PROVINCES_SISTER.get(provincia_norm)
+        if unsupported_reason:
+            raise Exception(unsupported_reason)
+
+        print("[VISURA_SOGGETTO] Navigando alla pagina di scelta servizio...")
+        await page.goto(
+            "https://sister3.agenziaentrate.gov.it/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_", timeout=60000
+        )
+        await _wait_for_ready(page, "select[name='listacom']", label="soggetto_scelta_servizio")
+        await logger.log(page, "scelta_servizio")
+
+        if "SceltaServizio.do" not in page.url:
+            raise Exception(f"Sessione scaduta o errore - URL: {page.url}")
+
+        provincia_value = await find_best_option_match(page, "select[name='listacom']", provincia)
+        if not provincia_value:
+            raise Exception(f"Provincia '{provincia}' non trovata nelle opzioni disponibili")
+
+        print(f"[VISURA_SOGGETTO] Selezionando provincia: {provincia_value}")
+        await page.locator("select[name='listacom']").select_option(provincia_value)
+        await page.locator("input[type='submit'][value='Applica']").click()
+
+        # Link nel menu sinistro: "Persona fisica" / "Persona giuridica"
+        link_text = "Persona fisica" if tipo_soggetto == "PF" else "Persona giuridica"
+        link_selectors = [
+            f"#menu-left a:has-text('{link_text}')",
+            f"a:has-text('{link_text}')",
+        ]
+        await _wait_for_ready(page, f"a:has-text('{link_text}')", label=f"soggetto_post_applica_{tipo_soggetto}")
+        await logger.log(page, "post_applica")
+
+        print(f"[VISURA_SOGGETTO] Cliccando link '{link_text}'...")
+        clicked = False
+        for sel in link_selectors:
+            try:
+                loc = page.locator(sel)
+                if await loc.count() > 0:
+                    await loc.first.click()
+                    clicked = True
+                    print(f"[VISURA_SOGGETTO] Link cliccato: {sel}")
+                    break
+            except Exception as e:
+                print(f"[VISURA_SOGGETTO] Selettore {sel} fallito: {e}")
+        if not clicked:
+            raise Exception(f"Link '{link_text}' non trovato dopo Applica")
+
+        await page.wait_for_load_state("domcontentloaded", timeout=30000)
+        await logger.log(page, "form_ufficio")
+
+    # STEP 2: Seleziona modalità ricerca per CF e inserisce CF
+    # PF: radio selDatiAna=CF_PF per attivare campo CF
+    # PNF: radio selCfDn=CF_PNF per attivare campo CF
+    if tipo_soggetto == "PF":
+        try:
+            await page.locator("input[name='selDatiAna'][value='CF_PF']").click()
+            print("[VISURA_SOGGETTO] Radio CF_PF selezionato")
+        except Exception as e:
+            print(f"[VISURA_SOGGETTO] Radio selDatiAna non trovato: {e}")
+        cf_field = "input[name='cod_fisc_pf']"
+    else:
+        try:
+            await page.locator("input[name='selCfDn'][value='CF_PNF']").click()
+            print("[VISURA_SOGGETTO] Radio CF_PNF selezionato")
+        except Exception as e:
+            print(f"[VISURA_SOGGETTO] Radio selCfDn non trovato: {e}")
+        cf_field = "input[name='cod_fisc']"
+
+    print(f"[VISURA_SOGGETTO] Inserendo codice fiscale con selettore: {cf_field}")
+    try:
+        await page.locator(cf_field).fill(codice_fiscale)
+    except Exception:
+        # Fallback per id
+        await page.locator("input[id='cf']").fill(codice_fiscale)
+
+    # STEP 3: tipoCatasto
+    print(f"[VISURA_SOGGETTO] Selezionando tipoCatasto: {tipo_catasto}")
+    try:
+        await page.locator("select[name='tipoCatasto']").select_option(tipo_catasto)
+    except Exception as e:
+        print(f"[VISURA_SOGGETTO] Errore selezione tipoCatasto: {e}")
+
+    # STEP 4: comuneCat — solo con ufficio (con ufficio è un <select>, nazionale è hidden)
+    if not nazionale:
+        target_comune = comune_cat if comune_cat else "$"
+        print(f"[VISURA_SOGGETTO] Selezionando comuneCat: {target_comune}")
+        try:
+            if target_comune == "$":
+                await page.locator("select[name='comuneCat']").select_option("$")
+            else:
+                comune_val = await find_best_option_match(page, "select[name='comuneCat']", target_comune)
+                if not comune_val:
+                    raise Exception(f"Comune '{target_comune}' non trovato nel dropdown comuneCat")
+                await page.locator("select[name='comuneCat']").select_option(comune_val)
+        except Exception as e:
+            print(f"[VISURA_SOGGETTO] Errore selezione comuneCat: {e}")
+
+    # STEP 5: tipo_richiesta — solo con ufficio, 'S' va cliccato ('A' è default)
+    if not nazionale and tipo_richiesta and tipo_richiesta != "A":
+        print(f"[VISURA_SOGGETTO] Selezionando tipo_richiesta: {tipo_richiesta}")
+        try:
+            await page.locator(f"input[name='tipo_richiesta'][value='{tipo_richiesta}']").click()
+        except Exception as e:
+            print(f"[VISURA_SOGGETTO] Errore selezione tipo_richiesta: {e}")
+
+    # STEP 6: Campi opzionali PF
+    if tipo_soggetto == "PF":
+        if cognome:
+            try:
+                await page.locator("input[name='cognome']").fill(cognome)
+            except Exception as e:
+                print(f"[VISURA_SOGGETTO] Errore fill cognome: {e}")
+        if nome:
+            try:
+                await page.locator("input[name='nome']").fill(nome)
+            except Exception as e:
+                print(f"[VISURA_SOGGETTO] Errore fill nome: {e}")
+        if gg_nascita:
+            try:
+                await page.locator("input[name='gg_nascita']").fill(gg_nascita)
+            except Exception as e:
+                print(f"[VISURA_SOGGETTO] Errore fill gg_nascita: {e}")
+        if mm_nascita:
+            try:
+                await page.locator("input[name='mm_nascita']").fill(mm_nascita)
+            except Exception as e:
+                print(f"[VISURA_SOGGETTO] Errore fill mm_nascita: {e}")
+        if anno_nascita:
+            try:
+                await page.locator("input[name='anno_nascita']").fill(anno_nascita)
+            except Exception as e:
+                print(f"[VISURA_SOGGETTO] Errore fill anno_nascita: {e}")
+        if sesso:
+            try:
+                await page.locator("select[name='sesso']").select_option(sesso)
+            except Exception as e:
+                print(f"[VISURA_SOGGETTO] Errore selezione sesso: {e}")
+        if provincia_amm_pf:
+            try:
+                await page.locator("select[name='provincia_amm_pf']").select_option(provincia_amm_pf)
+            except Exception as e:
+                print(f"[VISURA_SOGGETTO] Errore selezione provincia_amm_pf: {e}")
+        if luogo_nasc:
+            try:
+                await page.locator("select[name='luogo_nasc']").select_option({"label": luogo_nasc})
+            except Exception as e:
+                print(f"[VISURA_SOGGETTO] Errore selezione luogo_nasc: {e}")
+        if tipo_ispezione_pf:
+            try:
+                await page.locator(f"input[name='tipo_ispezione_pf'][value='{tipo_ispezione_pf}']").click()
+            except Exception as e:
+                print(f"[VISURA_SOGGETTO] Errore selezione tipo_ispezione_pf: {e}")
+
+    # STEP 6b: Campi opzionali PNF
+    elif tipo_soggetto == "PNF":
+        if denominazione:
+            try:
+                await page.locator("input[name='denominazione']").fill(denominazione)
+            except Exception as e:
+                print(f"[VISURA_SOGGETTO] Errore fill denominazione: {e}")
+        if provincia_amm:
+            try:
+                await page.locator("select[name='provincia_amm']").select_option(provincia_amm)
+            except Exception as e:
+                print(f"[VISURA_SOGGETTO] Errore selezione provincia_amm: {e}")
+        if sede:
+            try:
+                await page.locator("select[name='sede']").select_option({"label": sede})
+            except Exception as e:
+                print(f"[VISURA_SOGGETTO] Errore selezione sede: {e}")
+        if tipo_ispezione:
+            try:
+                await page.locator(f"input[name='tipo_ispezione'][value='{tipo_ispezione}']").click()
+            except Exception as e:
+                print(f"[VISURA_SOGGETTO] Errore selezione tipo_ispezione: {e}")
+
+    await logger.log(page, "form_compilato")
+
+    # STEP 6: Submit
+    print("[VISURA_SOGGETTO] Cliccando Ricerca...")
+    await page.locator("input[type='submit'][name='ricerca'][value='Ricerca']").click()
+    await page.wait_for_load_state("domcontentloaded", timeout=30000)
+    await logger.log(page, "risultati")
+
+    # STEP 7: Controlla assenza risultati
+    page_text = await page.inner_text("body")
+    if "NESSUNA CORRISPONDENZA TROVATA" in page_text:
+        time1 = time.time()
+        print(f"[VISURA_SOGGETTO] Nessuna corrispondenza trovata in {time1-time0:.2f}s")
+        return {"immobili": [], "total_results": 0, "error": "NESSUNA CORRISPONDENZA TROVATA"}
+
+    # STEP 8: Parse tabella risultati
+    print("[VISURA_SOGGETTO] Estraendo tabella risultati...")
+    immobili = []
+    result_selectors = [
+        "table.listaIsp4",
+        "table[class*='lista']",
+        "table:has(th:text('Foglio'))",
+        "table:has(th:text('Comune'))",
+        "table:has(th:text('Particella'))",
+        "table",
+    ]
+
+    for selector in result_selectors:
+        try:
+            table = page.locator(selector)
+            count = await table.count()
+            if count > 0:
+                for i in range(count):
+                    try:
+                        table_html = await table.nth(i).inner_html(timeout=10000)
+                        parsed = parse_table(table_html)
+                        if parsed:
+                            immobili = parsed
+                            print(f"[VISURA_SOGGETTO] Tabella estratta: {len(immobili)} righe con {selector}")
+                            break
+                    except Exception as e:
+                        print(f"[VISURA_SOGGETTO] Errore tabella {i}: {e}")
+                if immobili:
+                    break
+        except Exception as e:
+            print(f"[VISURA_SOGGETTO] Errore selettore {selector}: {e}")
+            continue
+
+    time1 = time.time()
+    print(f"[VISURA_SOGGETTO] Completata in {time1-time0:.2f}s, {len(immobili)} immobili")
+    return {"immobili": immobili, "total_results": len(immobili)}
+
+
 async def logout(page: Page):
     """Effettua il logout dal portale SISTER"""
     logger = PageLogger("logout")

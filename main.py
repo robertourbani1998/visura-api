@@ -33,7 +33,7 @@ from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from pydantic import BaseModel, Field, field_validator
 
-from utils import PageLogger, extract_all_sezioni, login, logout, run_visura, run_visura_immobile
+from utils import PageLogger, extract_all_sezioni, login, logout, run_visura, run_visura_immobile, run_visura_soggetto
 
 # Carica variabili d'ambiente da .env
 load_dotenv()
@@ -123,6 +123,37 @@ class VisuraIntestatiRequest:
     subalterno: Optional[str] = None
     sezione: Optional[str] = None
     codice_belfiore: Optional[str] = None
+    timestamp: datetime = None
+
+    def __post_init__(self):
+        if self.timestamp is None:
+            self.timestamp = datetime.now()
+
+
+@dataclass
+class VisuraSoggettoRequest:
+    request_id: str
+    tipo_soggetto: str
+    tipo_catasto: str
+    codice_fiscale: str
+    provincia: Optional[str] = None
+    comune_cat: Optional[str] = None
+    tipo_richiesta: Optional[str] = None
+    # Campi PF opzionali
+    cognome: Optional[str] = None
+    nome: Optional[str] = None
+    gg_nascita: Optional[str] = None
+    mm_nascita: Optional[str] = None
+    anno_nascita: Optional[str] = None
+    sesso: Optional[str] = None
+    provincia_amm_pf: Optional[str] = None
+    luogo_nasc: Optional[str] = None
+    tipo_ispezione_pf: Optional[str] = None
+    # Campi PNF opzionali
+    denominazione: Optional[str] = None
+    provincia_amm: Optional[str] = None
+    sede: Optional[str] = None
+    tipo_ispezione: Optional[str] = None
     timestamp: datetime = None
 
     def __post_init__(self):
@@ -643,6 +674,51 @@ class BrowserManager:
                 error=str(e),
             )
 
+    async def esegui_visura_soggetto(self, request: VisuraSoggettoRequest) -> VisuraResponse:
+        """Esegue una visura catastale per soggetto (persona fisica o giuridica)."""
+        try:
+            await self._ensure_authenticated()
+
+            result = await run_visura_soggetto(
+                self.auth_page,
+                tipo_soggetto=request.tipo_soggetto,
+                provincia=request.provincia,
+                comune_cat=request.comune_cat,
+                tipo_catasto=request.tipo_catasto,
+                codice_fiscale=request.codice_fiscale,
+                tipo_richiesta=request.tipo_richiesta,
+                cognome=request.cognome,
+                nome=request.nome,
+                gg_nascita=request.gg_nascita,
+                mm_nascita=request.mm_nascita,
+                anno_nascita=request.anno_nascita,
+                sesso=request.sesso,
+                provincia_amm_pf=request.provincia_amm_pf,
+                luogo_nasc=request.luogo_nasc,
+                tipo_ispezione_pf=request.tipo_ispezione_pf,
+                denominazione=request.denominazione,
+                provincia_amm=request.provincia_amm,
+                sede=request.sede,
+                tipo_ispezione=request.tipo_ispezione,
+            )
+
+            logger.info(f"Visura soggetto completata per {request.request_id}")
+            return VisuraResponse(
+                request_id=request.request_id,
+                success=True,
+                tipo_catasto=request.tipo_catasto,
+                data=result,
+            )
+
+        except Exception as e:
+            logger.error(f"Errore in visura soggetto {request.request_id}: {e}")
+            return VisuraResponse(
+                request_id=request.request_id,
+                success=False,
+                tipo_catasto=request.tipo_catasto,
+                error=str(e),
+            )
+
     async def restart_browser_if_needed(self):
         """Riavvia il browser se necessario"""
         try:
@@ -753,6 +829,11 @@ class VisuraService:
                     self.response_store[request.request_id] = response
                     logger.info(f"Processata richiesta intestati {request.request_id}")
 
+                elif isinstance(request, VisuraSoggettoRequest):
+                    response = await self.browser_manager.esegui_visura_soggetto(request)
+                    self.response_store[request.request_id] = response
+                    logger.info(f"Processata richiesta soggetto {request.request_id}")
+
                 else:
                     logger.error(f"Tipo di richiesta sconosciuto: {type(request)}")
 
@@ -794,6 +875,17 @@ class VisuraService:
             raise QueueFullError(f"Coda piena (limite {self.request_queue.maxsize}): riprovare più tardi") from e
         logger.info(
             f"Richiesta intestati {request.request_id} aggiunta alla coda (posizione: {self.request_queue.qsize()})"
+        )
+        return request.request_id
+
+    async def add_soggetto_request(self, request: VisuraSoggettoRequest) -> str:
+        """Aggiunge una richiesta visura soggetto alla coda."""
+        try:
+            self.request_queue.put_nowait({"request": request})
+        except asyncio.QueueFull as e:
+            raise QueueFullError(f"Coda piena (limite {self.request_queue.maxsize}): riprovare più tardi") from e
+        logger.info(
+            f"Richiesta soggetto {request.request_id} aggiunta alla coda (posizione: {self.request_queue.qsize()})"
         )
         return request.request_id
 
@@ -972,6 +1064,32 @@ class VisuraIntestatiInput(BaseModel):
         return v
 
 
+class VisuraSoggettoInput(BaseModel):
+    """Richiesta per una visura catastale per soggetto (persona fisica o giuridica)"""
+
+    tipo_soggetto: str = Field(..., pattern=r"^(PF|PNF)$", description="'PF' = Persona Fisica, 'PNF' = Persona Giuridica")
+    tipo_catasto: str = Field(..., pattern=r"^[ETF]$", description="'E' = Tutti, 'T' = Terreni, 'F' = Fabbricati")
+    codice_fiscale: str = Field(..., min_length=1, description="Codice fiscale del soggetto")
+    provincia: Optional[str] = Field(None, description="Nome della provincia; None = ricerca nazionale")
+    comune_cat: Optional[str] = Field(None, description="Nome del comune o '$' per tutta la provincia; None = tutta la provincia")
+    tipo_richiesta: Optional[str] = Field(None, pattern=r"^[AS]$", description="'A' = Attuale, 'S' = Storica; None = attuale (non disponibile in ricerca nazionale)")
+    # Campi PF opzionali
+    cognome: Optional[str] = Field(None, description="Cognome (solo PF, alternativo al CF)")
+    nome: Optional[str] = Field(None, description="Nome (solo PF)")
+    gg_nascita: Optional[str] = Field(None, description="Giorno nascita (solo PF)")
+    mm_nascita: Optional[str] = Field(None, description="Mese nascita (solo PF)")
+    anno_nascita: Optional[str] = Field(None, description="Anno nascita (solo PF)")
+    sesso: Optional[str] = Field(None, pattern=r"^[MF]$", description="Sesso: M/F (solo PF)")
+    provincia_amm_pf: Optional[str] = Field(None, description="Provincia di nascita, codice 2 lettere (solo PF)")
+    luogo_nasc: Optional[str] = Field(None, description="Comune di nascita (solo PF)")
+    tipo_ispezione_pf: Optional[str] = Field(None, pattern=r"^[RAL]$", description="'R' = Ristretta, 'A' = Ampliata, 'L' = Ampliata limitata (solo PF)")
+    # Campi PNF opzionali
+    denominazione: Optional[str] = Field(None, description="Denominazione azienda (solo PNF, alternativo al CF)")
+    provincia_amm: Optional[str] = Field(None, description="Provincia sede, codice 2 lettere (solo PNF)")
+    sede: Optional[str] = Field(None, description="Comune sede (solo PNF)")
+    tipo_ispezione: Optional[str] = Field(None, pattern=r"^[RA]$", description="'R' = Ristretta, 'A' = Ampliata (solo PNF)")
+
+
 class SezioniExtractionRequest(BaseModel):
     """Richiesta per l'estrazione delle sezioni territoriali"""
 
@@ -1113,6 +1231,58 @@ async def richiedi_intestati_immobile(
         raise HTTPException(status_code=429, detail=str(e))
     except Exception as e:
         logger.error(f"Errore nella richiesta intestati: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Errore interno del server. Consulta i log per i dettagli.")
+
+
+@app.post("/visura-soggetto")
+async def richiedi_visura_soggetto(
+    request: VisuraSoggettoInput,
+    service: VisuraService = Depends(get_visura_service),
+    _key: str = Depends(verify_api_key),
+):
+    """Richiede una visura catastale per soggetto (persona fisica o giuridica)"""
+    try:
+        request_id = f"soggetto_{request.tipo_soggetto}_{int(time.time() * 1000)}"
+        soggetto_req = VisuraSoggettoRequest(
+            request_id=request_id,
+            tipo_soggetto=request.tipo_soggetto,
+            tipo_catasto=request.tipo_catasto,
+            codice_fiscale=request.codice_fiscale,
+            provincia=request.provincia,
+            comune_cat=request.comune_cat,
+            tipo_richiesta=request.tipo_richiesta,
+            cognome=request.cognome,
+            nome=request.nome,
+            gg_nascita=request.gg_nascita,
+            mm_nascita=request.mm_nascita,
+            anno_nascita=request.anno_nascita,
+            sesso=request.sesso,
+            provincia_amm_pf=request.provincia_amm_pf,
+            luogo_nasc=request.luogo_nasc,
+            tipo_ispezione_pf=request.tipo_ispezione_pf,
+            denominazione=request.denominazione,
+            provincia_amm=request.provincia_amm,
+            sede=request.sede,
+            tipo_ispezione=request.tipo_ispezione,
+        )
+        await service.add_soggetto_request(soggetto_req)
+
+        return JSONResponse(
+            {
+                "request_ids": [request_id],
+                "tipo_soggetto": request.tipo_soggetto,
+                "status": "queued",
+                "message": f"Richiesta visura soggetto aggiunta alla coda",
+            }
+        )
+
+    except HTTPException:
+        raise
+    except QueueFullError as e:
+        logger.warning(f"Coda piena, rifiuto richiesta soggetto: {e}")
+        raise HTTPException(status_code=429, detail=str(e))
+    except Exception as e:
+        logger.error(f"Errore nella richiesta visura soggetto: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Errore interno del server. Consulta i log per i dettagli.")
 
 
