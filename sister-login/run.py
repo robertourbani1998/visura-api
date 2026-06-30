@@ -495,10 +495,34 @@ async def _esegui_visura_soggetto_con_pdf(self, request):
                     print("[PDF_SOG] Timeout elaborazione.")
 
                 content = await page.content()
+                print(f"[PDF_SOG] URL post-captcha: {page.url}")
+
+                # Dump bottoni/input sulla pagina per diagnostica
+                inputs = await page.locator('input[type="submit"], input[type="button"], button, a[href]').all()
+                for el in inputs[:15]:
+                    try:
+                        val = await el.get_attribute('value') or await el.inner_text()
+                        print(f"[PDF_SOG] Elemento trovato: {val!r}")
+                    except Exception:
+                        pass
+
+                # Salva HTML per ispezione
+                import os as _os2
+                _os2.makedirs("/app/logs/captcha_debug", exist_ok=True)
+                with open("/app/logs/captcha_debug/post_captcha_soggetto.html", "w") as _f:
+                    _f.write(content)
+
                 if "attendere elaborazione in corso" in content.lower():
                     print("[PDF_SOG] Documento non pronto, salto PDF.")
                 elif "documento" in content.lower() and "pronto" in content.lower():
-                    salva_btn = page.locator('input[value="Salva"], button:has-text("Salva"), a:has-text("Salva")')
+                    # Soggetto: il bottone potrebbe chiamarsi diversamente da immobile
+                    salva_btn = page.locator(
+                        'input[value="Salva"], input[value="salva"], '
+                        'input[value*="Salva"], input[value*="salva"], '
+                        'input[value*="Scarica"], input[value*="scarica"], '
+                        'button:has-text("Salva"), button:has-text("Scarica"), '
+                        'a:has-text("Salva"), a:has-text("Scarica")'
+                    )
                     if await salva_btn.count() > 0:
                         print("[PDF_SOG] Clicco 'Salva' per scaricare il documento...")
                         async with page.expect_download(timeout=60000) as download_info:
@@ -515,6 +539,8 @@ async def _esegui_visura_soggetto_con_pdf(self, request):
                         print("[PDF_SOG] PDF soggetto salvato.")
                     else:
                         print("[PDF_SOG] Bottone 'Salva' non trovato.")
+                else:
+                    print(f"[PDF_SOG] Pagina non riconosciuta. Estratto: {content[200:600]!r}")
         else:
             print("[PDF_SOG] Nessun bottone PDF trovato sulla pagina risultati.")
     except Exception as e:
