@@ -299,6 +299,141 @@ _main.BrowserManager.esegui_visura = _esegui_visura_con_pdf
 print("[RUN] Patch esegui_visura per generazione PDF documento ufficiale.")
 
 
+# --- Patch esegui_visura_soggetto: aggiunge PDF al termine del flusso soggetto ---
+# utils.py setta pdf_form_ready=True quando naviga al form captcha/PDF di Sister
+# (cliccando "Visura per Soggetto" nel form omonimi). Se invece siamo ancora sulla
+# lista HTML (caso nazionale senza bottone PDF), proviamo a trovare il bottone
+# "Visura per Soggetto" sulla pagina risultati.
+
+async def _risolvi_captcha_e_inoltra_soggetto(page, max_tentativi: int = 12) -> bool:
+    """Come _risolvi_captcha_e_inoltra ma per il form visura soggetto.
+
+    Il form soggetto non ha il radio ``intestati``: setta solo ``tipoDocFornitura=PDF``
+    se presente, poi clicca ``inoltra``.
+    """
+    for tentativo in range(max_tentativi):
+        captcha_el = page.locator('#imgCaptcha')
+        ha_captcha = await captcha_el.count() > 0
+
+        if ha_captcha:
+            await page.wait_for_function(
+                "document.querySelector('#imgCaptcha') && document.querySelector('#imgCaptcha').complete && document.querySelector('#imgCaptcha').naturalWidth > 0",
+                timeout=10000,
+            )
+            await asyncio.sleep(0.3)
+            img_bytes = await captcha_el.screenshot()
+
+            import os as _os
+            debug_dir = "/app/logs/captcha_debug"
+            _os.makedirs(debug_dir, exist_ok=True)
+            with open(f"{debug_dir}/captcha_soggetto_{tentativo+1}_raw.png", "wb") as f:
+                f.write(img_bytes)
+
+            testo = _leggi_captcha(img_bytes)
+            if len(testo) < 4:
+                print(f"[PDF_SOG] OCR insufficiente ('{testo}'), ricarico captcha...")
+                await page.locator('a[onclick*="reloadImg"]').click()
+                await asyncio.sleep(1.5)
+                continue
+            await page.locator('#inCaptchaChars').fill(testo)
+
+        # tipoDocFornitura=PDF se presente (opzionale per soggetto)
+        try:
+            tipo_loc = page.locator('input[type="radio"][name="tipoDocFornitura"][value="PDF"]')
+            if await tipo_loc.count() > 0:
+                await tipo_loc.check(timeout=2000)
+        except Exception:
+            pass
+
+        await page.locator('input[name="inoltra"]').click()
+        await page.wait_for_load_state("domcontentloaded", timeout=30000)
+        print(f"[PDF_SOG] Dopo inoltra (tentativo {tentativo+1}): {page.url}")
+
+        content = await page.content()
+        if "inCaptchaChars" in content or "Codice di sicurezza" in content:
+            print("[PDF_SOG] Captcha errato, ricarico e riprovo...")
+            await page.locator('a[onclick*="reloadImg"]').click()
+            await asyncio.sleep(1)
+            continue
+
+        return True
+
+    print("[PDF_SOG] Form non inviato dopo tutti i tentativi.")
+    return False
+
+
+_orig_esegui_visura_soggetto = _main.BrowserManager.esegui_visura_soggetto
+
+
+async def _esegui_visura_soggetto_con_pdf(self, request):
+    response = await _orig_esegui_visura_soggetto(self, request)
+    if not response.success:
+        self.authenticated = False
+        return response
+
+    # Omonimi non ancora selezionati: niente PDF ora
+    if response.data and response.data.get('omonimi_required'):
+        return response
+
+    try:
+        page = self.auth_page
+        data = response.data or {}
+        already_on_form = data.get('pdf_form_ready', False)
+
+        if not already_on_form:
+            # Pagina risultati HTML: cerca bottone "Visura per Soggetto"
+            btn = page.locator('input[value="Visura per Soggetto"]')
+            if await btn.count() > 0:
+                print("[PDF_SOG] Clicco 'Visura per Soggetto' dalla pagina risultati...")
+                await btn.first.click()
+                await page.wait_for_load_state("domcontentloaded", timeout=30000)
+                already_on_form = True
+
+        if already_on_form:
+            ok = await _risolvi_captcha_e_inoltra_soggetto(page)
+            if ok:
+                print("[PDF_SOG] Attendo elaborazione documento...")
+                try:
+                    await page.wait_for_function(
+                        "!document.body.innerText.toLowerCase().includes('attendere elaborazione in corso')",
+                        timeout=90000,
+                    )
+                except Exception:
+                    print("[PDF_SOG] Timeout elaborazione.")
+
+                content = await page.content()
+                if "attendere elaborazione in corso" in content.lower():
+                    print("[PDF_SOG] Documento non pronto, salto PDF.")
+                elif "documento" in content.lower() and "pronto" in content.lower():
+                    salva_btn = page.locator('input[value="Salva"], button:has-text("Salva"), a:has-text("Salva")')
+                    if await salva_btn.count() > 0:
+                        print("[PDF_SOG] Clicco 'Salva' per scaricare il documento...")
+                        async with page.expect_download(timeout=60000) as download_info:
+                            await salva_btn.first.click()
+                        download = await download_info.value
+                        path = await download.path()
+                        with open(path, 'rb') as f:
+                            pdf_bytes = f.read()
+                        print(f"[PDF_SOG] Download completato: {download.suggested_filename} ({len(pdf_bytes)} bytes)")
+                        if response.data is None:
+                            response.data = {}
+                        response.data["pdf_base64"] = base64.b64encode(pdf_bytes).decode()
+                        response.data.pop('pdf_form_ready', None)
+                        print("[PDF_SOG] PDF soggetto salvato.")
+                    else:
+                        print("[PDF_SOG] Bottone 'Salva' non trovato.")
+        else:
+            print("[PDF_SOG] Nessun bottone PDF trovato sulla pagina risultati.")
+    except Exception as e:
+        print(f"[PDF_SOG] Errore generazione PDF soggetto: {e}")
+
+    return response
+
+
+_main.BrowserManager.esegui_visura_soggetto = _esegui_visura_soggetto_con_pdf
+print("[RUN] Patch esegui_visura_soggetto per generazione PDF documento ufficiale.")
+
+
 # --- Endpoint /login aggiunto all'app FastAPI esistente ---
 
 class LoginPayload(BaseModel):

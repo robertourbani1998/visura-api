@@ -1707,8 +1707,18 @@ async def run_visura_soggetto(
         if not radio_clicked:
             raise ValueError(f"Omonimo non trovato con valore: {omonimo_valore}")
 
-        # Il bottone di conferma omonimo può avere name="immobili" value="Immobili" (ricerca provinciale)
-        # oppure name="visura" value="Ricerca" (ricerca nazionale) — uso il primo input[type='submit'] del form.
+        # Preferisci "Visura per Soggetto" (genera PDF) se disponibile nel form omonimi;
+        # fallback al primo submit (Ricerca/Immobili) che mostra lista HTML.
+        pdf_btn = page.locator("form[name='SceltaOmonimiForm'] input[value='Visura per Soggetto']")
+        if await pdf_btn.count() > 0:
+            print("[VISURA_SOGGETTO] Cliccando 'Visura per Soggetto' per generazione PDF...")
+            await pdf_btn.first.click()
+            await page.wait_for_load_state("domcontentloaded", timeout=30000)
+            await logger.log(page, "visura_per_soggetto_form")
+            # La pagina è ora il form captcha/PDF: run.py gestirà download.
+            return {"immobili": [], "total_results": 0, "pdf_form_ready": True}
+
+        # Fallback: "Ricerca" (nazionale) o "Immobili" (provinciale) → lista HTML
         await page.locator("form[name='SceltaOmonimiForm'] input[type='submit']").first.click()
         await page.wait_for_load_state("domcontentloaded", timeout=30000)
         await logger.log(page, "immobili_soggetto")
