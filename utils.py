@@ -1470,81 +1470,80 @@ async def run_visura_soggetto(
         f"comune_cat={comune_cat}, tipo_catasto={tipo_catasto}, tipo_richiesta={tipo_richiesta}"
     )
 
-    if nazionale:
-        # Ricerca nazionale: naviga direttamente a SceltaLink con codUfficio=IT
-        link_nazionale = f"https://sister3.agenziaentrate.gov.it/Visure/SceltaLink.do?lista={lista}&codUfficio=IT"
-        print(f"[VISURA_SOGGETTO] Ricerca nazionale, navigo direttamente a: {link_nazionale}")
-        await page.goto(link_nazionale, timeout=60000)
-        await page.wait_for_load_state("domcontentloaded", timeout=30000)
-        await logger.log(page, "form_nazionale")
-    else:
-        # Ricerca per ufficio: SceltaServizio → Applica → click link soggetto
+    # STEP 1: SceltaServizio → seleziona ufficio/nazionale → Applica → click link soggetto.
+    # Sister richiede sempre il passaggio per SceltaServizio per stabilire lo stato di sessione;
+    # la navigazione diretta a SceltaLink.do senza questo passo restituisce pagina "Errore".
+    if not nazionale:
         provincia_norm = _normalize_for_match(provincia)
         unsupported_reason = _UNSUPPORTED_PROVINCES_SISTER.get(provincia_norm)
         if unsupported_reason:
             raise Exception(unsupported_reason)
 
-        print("[VISURA_SOGGETTO] Navigando alla pagina di scelta servizio...")
-        await page.goto(
-            "https://sister3.agenziaentrate.gov.it/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_", timeout=60000
-        )
-        await _wait_for_ready(page, "select[name='listacom']", label="soggetto_scelta_servizio")
-        await logger.log(page, "scelta_servizio")
+    print("[VISURA_SOGGETTO] Navigando alla pagina di scelta servizio...")
+    await page.goto(
+        "https://sister3.agenziaentrate.gov.it/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_", timeout=60000
+    )
+    await _wait_for_ready(page, "select[name='listacom']", label="soggetto_scelta_servizio")
+    await logger.log(page, "scelta_servizio")
 
-        if "SceltaServizio.do" not in page.url:
-            raise Exception(f"Sessione scaduta o errore - URL: {page.url}")
+    if "SceltaServizio.do" not in page.url:
+        raise Exception(f"Sessione scaduta o errore - URL: {page.url}")
 
+    if nazionale:
+        print("[VISURA_SOGGETTO] Selezionando NAZIONALE...")
+        await page.locator("select[name='listacom']").select_option(" NAZIONALE-IT")
+    else:
         provincia_value = await find_best_option_match(page, "select[name='listacom']", provincia)
         if not provincia_value:
             raise Exception(f"Provincia '{provincia}' non trovata nelle opzioni disponibili")
-
         print(f"[VISURA_SOGGETTO] Selezionando provincia: {provincia_value}")
         await page.locator("select[name='listacom']").select_option(provincia_value)
-        await page.locator("input[type='submit'][value='Applica']").click()
 
-        # Link nel menu sinistro: "Persona fisica" / "Persona giuridica"
-        link_text = "Persona fisica" if tipo_soggetto == "PF" else "Persona giuridica"
-        link_selectors = [
-            f"#menu-left a:has-text('{link_text}')",
-            f"a:has-text('{link_text}')",
-        ]
-        await _wait_for_ready(page, f"a:has-text('{link_text}')", label=f"soggetto_post_applica_{tipo_soggetto}")
-        await logger.log(page, "post_applica")
+    await page.locator("input[type='submit'][value='Applica']").click()
 
-        print(f"[VISURA_SOGGETTO] Cliccando link '{link_text}'...")
-        clicked = False
-        for sel in link_selectors:
-            try:
-                loc = page.locator(sel)
-                if await loc.count() > 0:
-                    await loc.first.click()
-                    clicked = True
-                    print(f"[VISURA_SOGGETTO] Link cliccato: {sel}")
-                    break
-            except Exception as e:
-                print(f"[VISURA_SOGGETTO] Selettore {sel} fallito: {e}")
-        if not clicked:
-            raise Exception(f"Link '{link_text}' non trovato dopo Applica")
+    # Link nel menu sinistro: "Persona fisica" / "Persona giuridica"
+    link_text = "Persona fisica" if tipo_soggetto == "PF" else "Persona giuridica"
+    link_selectors = [
+        f"#menu-left a:has-text('{link_text}')",
+        f"a:has-text('{link_text}')",
+    ]
+    await _wait_for_ready(page, f"a:has-text('{link_text}')", label=f"soggetto_post_applica_{tipo_soggetto}")
+    await logger.log(page, "post_applica")
 
-        await page.wait_for_load_state("domcontentloaded", timeout=30000)
-        await logger.log(page, "form_ufficio")
+    print(f"[VISURA_SOGGETTO] Cliccando link '{link_text}'...")
+    clicked = False
+    for sel in link_selectors:
+        try:
+            loc = page.locator(sel)
+            if await loc.count() > 0:
+                await loc.first.click()
+                clicked = True
+                print(f"[VISURA_SOGGETTO] Link cliccato: {sel}")
+                break
+        except Exception as e:
+            print(f"[VISURA_SOGGETTO] Selettore {sel} fallito: {e}")
+    if not clicked:
+        raise Exception(f"Link '{link_text}' non trovato dopo Applica")
+
+    await page.wait_for_load_state("domcontentloaded", timeout=30000)
+    await logger.log(page, "form_soggetto")
 
     # STEP 2: Seleziona modalità ricerca per CF e inserisce CF
     # PF: radio selDatiAna=CF_PF per attivare campo CF
     # PNF: radio selCfDn=CF_PNF per attivare campo CF
     if tipo_soggetto == "PF":
         try:
-            await page.locator("input[name='selDatiAna'][value='CF_PF']").click()
+            await page.locator("input[name='selDatiAna'][value='CF_PF']").click(timeout=5000)
             print("[VISURA_SOGGETTO] Radio CF_PF selezionato")
         except Exception as e:
-            print(f"[VISURA_SOGGETTO] Radio selDatiAna non trovato: {e}")
+            print(f"[VISURA_SOGGETTO] Radio selDatiAna non trovato (non critico): {e}")
         cf_field = "input[name='cod_fisc_pf']"
     else:
         try:
-            await page.locator("input[name='selCfDn'][value='CF_PNF']").click()
+            await page.locator("input[name='selCfDn'][value='CF_PNF']").click(timeout=5000)
             print("[VISURA_SOGGETTO] Radio CF_PNF selezionato")
         except Exception as e:
-            print(f"[VISURA_SOGGETTO] Radio selCfDn non trovato: {e}")
+            print(f"[VISURA_SOGGETTO] Radio selCfDn non trovato (non critico): {e}")
         cf_field = "input[name='cod_fisc']"
 
     print(f"[VISURA_SOGGETTO] Inserendo codice fiscale con selettore: {cf_field}")
@@ -1576,8 +1575,8 @@ async def run_visura_soggetto(
         except Exception as e:
             print(f"[VISURA_SOGGETTO] Errore selezione comuneCat: {e}")
 
-    # STEP 5: tipo_richiesta — solo con ufficio, 'S' va cliccato ('A' è default)
-    if not nazionale and tipo_richiesta and tipo_richiesta != "A":
+    # STEP 5: tipo_richiesta — presente su entrambe le form (ufficio e nazionale), 'S' va cliccato ('A' è default)
+    if tipo_richiesta and tipo_richiesta != "A":
         print(f"[VISURA_SOGGETTO] Selezionando tipo_richiesta: {tipo_richiesta}")
         try:
             await page.locator(f"input[name='tipo_richiesta'][value='{tipo_richiesta}']").click()
