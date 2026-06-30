@@ -58,10 +58,11 @@ def _get_ocr_reader():
 
 
 def _leggi_captcha(img_bytes: bytes) -> str:
-    """Tenta di leggere il captcha con EasyOCR e 4 strategie di preprocessing."""
+    """Legge il captcha con EasyOCR e preprocessing adattivo per 4 stili Sister."""
     from PIL import Image, ImageOps, ImageEnhance
     import numpy as np
     import io as _io
+    from collections import Counter
 
     reader = _get_ocr_reader()
     img = Image.open(_io.BytesIO(img_bytes))
@@ -74,44 +75,81 @@ def _leggi_captcha(img_bytes: bytes) -> str:
         except Exception:
             return ''
 
+    def to_png(pil_img):
+        buf = _io.BytesIO()
+        pil_img.save(buf, 'PNG')
+        return buf.getvalue()
+
+    def scale(pil_img, factor=4):
+        return pil_img.resize((pil_img.width * factor, pil_img.height * factor), Image.LANCZOS)
+
     results = []
 
-    # Strategia 1: gray + autocontrast + 3x  (ottima per stile rosso/verde)
+    # --- Rilevamento stile ---
+    brightness = float(arr.mean())
+    rg_diff = np.clip(arr[:, :, 0].astype(int) - arr[:, :, 1].astype(int), 0, 255)
+    br_diff = np.clip(arr[:, :, 2].astype(int) - arr[:, :, 0].astype(int), 0, 255)
+    rb_diff = np.clip(arr[:, :, 0].astype(int) - arr[:, :, 2].astype(int), 0, 255)
+    red_frac  = float((rg_diff > 80).mean())
+    blue_frac = float((br_diff > 80).mean())
+    dark_bg   = brightness < 80  # sfondo nero (testo giallo/chiaro su nero)
+    print(f"[OCR] Style detect: brightness={brightness:.1f} red_frac={red_frac:.3f} blue_frac={blue_frac:.3f} dark_bg={dark_bg}")
+
+    # --- Stile 1: sfondo scuro (testo chiaro su nero) → inverto e processo ---
+    if dark_bg:
+        arr_inv = 255 - arr
+        img_inv = Image.fromarray(arr_inv.astype(np.uint8))
+        ig_inv = ImageOps.autocontrast(img_inv.convert('L'))
+        results.append(('inv+gray+4x', read(to_png(scale(ig_inv)))))
+        results.append(('inv+color+4x', read(to_png(scale(img_inv)))))
+        ig_sharp = ImageEnhance.Sharpness(ig_inv).enhance(3.0)
+        results.append(('inv+sharp+4x', read(to_png(scale(ig_sharp)))))
+        # Canale G dopo inversione: testo giallo → inv_G basso, bg nero → inv_G alto
+        g_inv = ImageOps.autocontrast(Image.fromarray((255 - arr[:, :, 1]).astype(np.uint8)))
+        results.append(('inv+G+4x', read(to_png(scale(g_inv)))))
+        print(f"[OCR] Strategie (dark_bg): { {k: v for k, v in results} }")
+
+    # --- Stile 2: testo blu su sfondo chiaro uniforme (blu su azzurro/bianco) ---
+    # Isola il testo con canale R invertito: testo blu ha R basso, sfondo chiaro ha R alto
+    if blue_frac > 0.05 and not dark_bg:
+        r_ch = arr[:, :, 0].astype(np.uint8)
+        r_inv = ImageOps.autocontrast(Image.fromarray(255 - r_ch))
+        results.append(('inv_R+4x', read(to_png(scale(r_inv)))))
+        # Anche G invertito: testo blu ha G basso
+        g_ch = arr[:, :, 1].astype(np.uint8)
+        g_inv = ImageOps.autocontrast(Image.fromarray(255 - g_ch))
+        results.append(('inv_G+4x', read(to_png(scale(g_inv)))))
+        # Saturazione HSV: testo colorato puro ha alta saturazione, sfondo uniforme bassa
+        try:
+            rgb_f = arr / 255.0
+            cmax = rgb_f.max(axis=2)
+            cmin = rgb_f.min(axis=2)
+            sat_arr = np.where(cmax > 0, (cmax - cmin) / cmax, 0)
+            sat_ch = ImageOps.autocontrast(Image.fromarray((sat_arr * 255).astype(np.uint8)))
+            results.append(('sat+4x', read(to_png(scale(sat_ch)))))
+        except Exception:
+            pass
+
+    # --- Strategie universali (tutte le immagini) ---
     ig = ImageOps.autocontrast(img.convert('L'))
-    ig3 = ig.resize((ig.width * 3, ig.height * 3), Image.LANCZOS)
-    buf = _io.BytesIO(); ig3.save(buf, 'PNG')
-    results.append(('gray+3x', read(buf.getvalue())))
-
-    # Strategia 2: sharpen + gray + 3x  (ottima per stile bianco/blu)
+    results.append(('gray+4x', read(to_png(scale(ig)))))
     ig_sharp = ImageEnhance.Sharpness(ig).enhance(3.0)
-    ig3s = ig_sharp.resize((ig.width * 3, ig.height * 3), Image.LANCZOS)
-    buf = _io.BytesIO(); ig3s.save(buf, 'PNG')
-    results.append(('sharp+gray+3x', read(buf.getvalue())))
+    results.append(('sharp+4x', read(to_png(scale(ig_sharp)))))
+    results.append(('color+4x', read(to_png(scale(img)))))
 
-    # Strategia 3: canale colore più contrastato + 3x  (ottima per stile blu glow)
+    # Canale con la maggiore deviazione standard (massimo contrasto testo/bg)
     best_ch = int(np.argmax([arr[:, :, c].std() for c in range(3)]))
     ich = ImageOps.autocontrast(Image.fromarray(arr[:, :, best_ch]))
-    ich3 = ich.resize((ich.width * 3, ich.height * 3), Image.LANCZOS)
-    buf = _io.BytesIO(); ich3.save(buf, 'PNG')
-    results.append((f'ch{best_ch}+3x', read(buf.getvalue())))
+    results.append((f'ch{best_ch}+4x', read(to_png(scale(ich)))))
 
-    # Strategia 4: colore originale 3x
-    img3 = img.resize((img.width * 3, img.height * 3), Image.LANCZOS)
-    buf = _io.BytesIO(); img3.save(buf, 'PNG')
-    results.append(('color+3x', read(buf.getvalue())))
-
-    # Strategie 5-9: separazione canali colore (efficace per captcha colorati)
-    # R-G: testo rosso/giallo su sfondo scuro; B-R/B-G: testo blu su qualsiasi sfondo
-    w, h = img.width * 3, img.height * 3
+    # Separazione canali differenza: utile per testo colorato su sfondo colorato
+    w, h = img.width * 4, img.height * 4
     for name, ch_a, ch_b in [('R-G', 0, 1), ('R-B', 0, 2), ('G-B', 1, 2), ('B-R', 2, 0), ('B-G', 2, 1)]:
         diff = np.clip(arr[:, :, ch_a].astype(int) - arr[:, :, ch_b].astype(int), 0, 255).astype(np.uint8)
         diff_img = ImageOps.autocontrast(Image.fromarray(diff)).resize((w, h), Image.LANCZOS)
-        buf = _io.BytesIO(); diff_img.save(buf, 'PNG')
-        results.append((name + '+3x', read(buf.getvalue())))
+        results.append((name + '+4x', read(to_png(diff_img))))
 
-    print(f"[OCR] Strategie: { {k: v for k, v in results} }")
-
-    from collections import Counter
+    print(f"[OCR] Strategie (all): { {k: v for k, v in results} }")
 
     results_dict = {k: v for k, v in results}
 
@@ -119,31 +157,40 @@ def _leggi_captcha(img_bytes: bytes) -> str:
         t = results_dict.get(key, '')
         return t if 5 <= len(t) <= 10 else ''
 
-    # Rilevamento stile basato su pixel dominanti
-    rg_diff = np.clip(arr[:, :, 0].astype(int) - arr[:, :, 1].astype(int), 0, 255)
-    br_diff = np.clip(arr[:, :, 2].astype(int) - arr[:, :, 0].astype(int), 0, 255)
-    red_frac  = float((rg_diff > 80).mean())   # testo rosso su verde
-    blue_frac = float((br_diff > 80).mean())   # testo blu su sfondo chiaro
-    print(f"[OCR] Style detect: red_frac={red_frac:.3f} blue_frac={blue_frac:.3f}")
+    # --- Selezione risultato per stile ---
 
-    # Testo blu su qualsiasi sfondo (incluso rosso): B-R isola il testo blu
-    # Priorità PRIMA di rosso: captcha blu-su-rosso ha red_frac alto (bg rosso)
-    # ma deve usare B-R, non R-G.
+    # Sfondo scuro: priorità alle strategie di inversione
+    if dark_bg:
+        for key in ('inv+gray+4x', 'inv+sharp+4x', 'inv+G+4x', 'inv+color+4x'):
+            t = pick(key)
+            if t:
+                print(f"[OCR] Stile SCURO → {key}: '{t}'")
+                return t
+
+    # Testo blu su sfondo chiaro uniforme
+    if blue_frac > 0.05 and not dark_bg:
+        for key in ('inv_R+4x', 'inv_G+4x', 'sat+4x', 'B-R+4x', 'B-G+4x'):
+            t = pick(key)
+            if t:
+                print(f"[OCR] Stile BLU-UNIFORME → {key}: '{t}'")
+                return t
+
+    # Testo blu su sfondo qualsiasi
     if blue_frac > 0.15:
-        for key in ('B-R+3x', 'B-G+3x'):
+        for key in ('B-R+4x', 'B-G+4x'):
             t = pick(key)
             if t:
                 print(f"[OCR] Stile BLU → {key}: '{t}'")
                 return t
 
-    # Testo rosso/giallo su sfondo scuro/verde: R-G isola il testo
+    # Testo rosso/arancione su sfondo giallo/verde
     if red_frac > 0.1:
-        t = pick('R-G+3x')
+        t = pick('R-G+4x')
         if t:
-            print(f"[OCR] Stile ROSSO/VERDE → R-G: '{t}'")
+            print(f"[OCR] Stile ROSSO → R-G: '{t}'")
             return t
 
-    # Tutti gli altri stili: maggioranza
+    # Maggioranza su tutti i risultati validi
     validi = [t for _, t in results if 5 <= len(t) <= 10]
     if validi:
         counter = Counter(validi)
@@ -151,10 +198,13 @@ def _leggi_captcha(img_bytes: bytes) -> str:
         print(f"[OCR] Maggioranza: '{best_t}' ({count} voti)")
         return best_t
 
-    # Fallback: il risultato più lungo
-    fallback = max(results, key=lambda x: len(x[1]))
-    print(f"[OCR] Fallback '{fallback[1]}' da strategia {fallback[0]}")
-    return fallback[1]
+    # Fallback: risultato più lungo
+    if results:
+        fallback = max(results, key=lambda x: len(x[1]))
+        print(f"[OCR] Fallback '{fallback[1]}' da '{fallback[0]}'")
+        return fallback[1]
+
+    return ''
 
 
 async def _ensure_authenticated_sister(self):
@@ -305,7 +355,7 @@ print("[RUN] Patch esegui_visura per generazione PDF documento ufficiale.")
 # lista HTML (caso nazionale senza bottone PDF), proviamo a trovare il bottone
 # "Visura per Soggetto" sulla pagina risultati.
 
-async def _risolvi_captcha_e_inoltra_soggetto(page, max_tentativi: int = 12) -> bool:
+async def _risolvi_captcha_e_inoltra_soggetto(page, max_tentativi: int = 20) -> bool:
     """Come _risolvi_captcha_e_inoltra ma per il form visura soggetto.
 
     Il form soggetto non ha il radio ``intestati``: setta solo ``tipoDocFornitura=PDF``
