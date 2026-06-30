@@ -1707,7 +1707,9 @@ async def run_visura_soggetto(
         if not radio_clicked:
             raise ValueError(f"Omonimo non trovato con valore: {omonimo_valore}")
 
-        await page.locator("form[name='SceltaOmonimiForm'] input[name='immobili'][value='Immobili']").click()
+        # Il bottone di conferma omonimo può avere name="immobili" value="Immobili" (ricerca provinciale)
+        # oppure name="visura" value="Ricerca" (ricerca nazionale) — uso il primo input[type='submit'] del form.
+        await page.locator("form[name='SceltaOmonimiForm'] input[type='submit']").first.click()
         await page.wait_for_load_state("domcontentloaded", timeout=30000)
         await logger.log(page, "immobili_soggetto")
         # Ri-controlla assenza risultati dopo navigazione omonimi
